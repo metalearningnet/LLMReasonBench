@@ -1,0 +1,6 @@
+/data/
+/wandb/
+/output/
+/targets/
+__pycache__/
+*.py[cod]

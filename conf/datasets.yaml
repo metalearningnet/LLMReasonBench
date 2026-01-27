@@ -1,0 +1,108 @@
+strategy_qa:
+  source: "ChilleD/StrategyQA"
+  split_mapping:
+    train: "train"
+    test: "test"
+  answer_type: "boolean"
+  field_mapping:
+    question: "question"
+    answer: "answer"
+  clean_latex: false
+
+commonsense_qa:
+  source: "tau/commonsense_qa"
+  split_mapping:
+    train: "train"
+    test: "validation"
+  answer_type: "multiple_choice"
+  valid_answers: ["A", "B", "C", "D", "E"]
+  field_mapping:
+    question: "question"
+    answer: "answerKey"
+    choices: "choices"
+  clean_latex: false
+
+truthful_qa:
+  source: "truthfulqa/truthful_qa"
+  config_name: "multiple_choice"
+  split_mapping:
+    train: "validation"
+    test: "validation"
+  answer_type: "multiple_choice"
+  valid_answers: ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]
+  field_mapping:
+    question: "question"
+    answer: "mc1_targets"
+    choices: "mc1_targets"
+  clean_latex: false
+
+metamath_qa:
+  source: "meta-math/MetaMathQA"
+  split_mapping:
+    train: "train"
+    test: "train"
+  answer_type: "numeric"
+  field_mapping:
+    question: "query"
+    answer: "response"
+  clean_latex: true
+
+aqua:
+    source: "deepmind/aqua_rat"
+    split_mapping:
+      train: "train"
+      test: "test"
+    answer_type: "multiple_choice"
+    valid_answers: ["A", "B", "C", "D", "E"]
+    field_mapping:
+      question: "question"
+      answer: "correct"
+      options: "options"
+    clean_latex: true
+
+mmlupro:
+  source: "TIGER-Lab/MMLU-Pro"
+  split_mapping:
+    train: "validation"
+    test: "test"
+  answer_type: "multiple_choice"
+  valid_answers: ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+  field_mapping:
+    question: "question"
+    answer: "answer"
+    choices: "choices"
+  clean_latex: true
+
+gsm8k:
+  source: "openai/gsm8k"
+  config_name: "main"
+  split_mapping:
+    train: "train"
+    test: "test"
+  answer_type: "numeric"
+  field_mapping:
+    question: "question"
+    answer: "answer"
+  clean_latex: true
+
+aime24:
+  source: "HuggingFaceH4/aime_2024"
+  split_mapping:
+    train: "train"
+    test: "train"
+  answer_type: "numeric"
+  field_mapping:
+    question: "problem"
+    answer: "answer"
+  clean_latex: true
+
+aime25:
+  source: "math-ai/aime25"
+  split_mapping:
+    train: "test"
+    test: "test"
+  answer_type: "numeric"
+  field_mapping:
+    question: "problem"
+    answer: "answer"
+  clean_latex: true

@@ -1,0 +1,508 @@
+import torch
+import transformers
+from dataset import DATASET_MAP
+from lm_trainer import LMTrainer
+from preprocess import DataConfig
+from huggingface_hub import login
+from load_model import AutoCausalLM
+from typing import Optional, Dict, List
+from dataclasses import dataclass, field
+from peft_model import PeftModelForCausalLMWrapper
+from supervised_dataset import make_supervised_data_module
+from fixed_length_dataset import make_fixed_length_data_module
+from transformers.utils import logging as transformers_logging
+from peft import LoraConfig, TaskType, prepare_model_for_kbit_training
+from config import (
+    COT_TOKENS, DEFAULT_TRAIN_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR,
+    load_config, load_datasets_config, update_dataclass_from_config, setup_directories, logger, dataset_names
+)
+
+transformers_logging.set_verbosity_info()
+transformers_logging.enable_explicit_format()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+logger.info(f"Using device: {device}")
+logger.info(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    logger.info(f"CUDA device count: {torch.cuda.device_count()}")
+    for i in range(torch.cuda.device_count()):
+        logger.info(f"  Device {i}: {torch.cuda.get_device_name(i)}")
+
+@dataclass
+class ModelArguments:
+    random_initialize: Optional[bool] = field(default=False)
+    model_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Pre-trained model name on Huggingface or checkpoint path."}
+    )
+    hf_hub_token: Optional[str] = field(default="none")
+    parameter_efficient_mode: Optional[str] = field(
+        default="none",
+        metadata={"choices": ["none", "prompt-tuning", "lora", "lora+prompt-tuning"]}
+    )
+    use_calculator: Optional[bool] = field(default=False)
+    lora_module: Optional[str] = field(default="mlp")
+    lora_r: Optional[int] = field(default=16)
+    lora_alpha: Optional[int] = field(default=16)
+    lora_dropout: Optional[float] = field(default=0.05)
+    lora_bias: Optional[str] = field(
+        default="none",
+        metadata={"choices": ["none", "all", "lora_only"]}
+    )
+    lora_inference_mode: Optional[bool] = field(default=False)
+    lora_target_modules: Optional[List[str]] = field(
+        default_factory=lambda: ["q_proj", "v_proj"]
+    )
+    lora_init_lora_weights: Optional[bool] = field(default=True)
+    lora_fan_in_fan_out: Optional[bool] = field(default=False)
+
+@dataclass
+class DataArguments:
+    dataset: str = field(
+        default="truthful_qa",
+        metadata={
+            "help": "Dataset name.",
+            "choices": dataset_names
+        }
+    )
+    mode: str = field(
+        default="supervised",
+        metadata={"choices": ["supervised", "fixed_length"]}
+    )
+    num_train: Optional[int] = field(default=None)
+    num_test: Optional[int] = field(default=None)
+    embedding_model_name: Optional[str] = field(default=None)
+
+@dataclass
+class TrainingArguments(transformers.TrainingArguments):
+    cache_dir: Optional[str] = field(default=None)
+    optim: str = field(default="adamw_torch")
+    model_max_length: int = field(
+        default=1024,
+        metadata={"help": "Maximum sequence length. Sequences will be left padded (and possibly truncated)."}
+    )
+    resume: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Resume training from a checkpoint."}
+    )
+    int8_training: Optional[bool] = field(default=False)
+    load_in_8bit: Optional[bool] = field(default=False)
+    load_in_4bit: Optional[bool] = field(default=False)
+    num_train_epochs: Optional[int] = field(default=1)
+    learning_rate: Optional[float] = field(default=1e-5)
+    warmup_steps: Optional[int] = field(default=100)
+    gradient_accumulation_steps: Optional[int] = field(default=4)
+    logging_steps: Optional[int] = field(default=10)
+    eval_steps: Optional[int] = field(default=50)
+    save_steps: Optional[int] = field(default=100)
+    save_total_limit: Optional[int] = field(default=1)
+    fp16: Optional[bool] = field(default=True)
+    bf16: Optional[bool] = field(default=False)
+    output_dir: str = field(default=DEFAULT_TRAIN_OUTPUT_DIR)
+    
+    def __post_init__(self):
+        super().__post_init__()
+        self.checkpoint_dir = DEFAULT_CHECKPOINT_DIR
+
+def log_trainable_parameters(model: torch.nn.Module):
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    all_param = sum(p.numel() for p in model.parameters())
+    trainable_percent = 100 * trainable_params / all_param if all_param > 0 else 0
+    
+    logger.info(
+        f"Trainable parameters: {trainable_params:,} || "
+        f"All parameters: {all_param:,} || "
+        f"Trainable: {trainable_percent:.2f}%"
+    )
+    
+    return trainable_params, all_param, trainable_percent
+
+def enable_prompt_tuning(model: torch.nn.Module):
+    model.get_input_embeddings().new_embedding.weight.requires_grad = True
+    model.get_output_embeddings().new_linear.weight.requires_grad = True
+    logger.debug("Prompt tuning enabled")
+
+def create_tokenizer(model_name: str, cache_dir: Optional[str]) -> transformers.PreTrainedTokenizer:
+    logger.debug(f"Creating tokenizer for model: {model_name}")
+    
+    if 'llama' in model_name.lower() or 'alpaca' in model_name.lower():
+        tokenizer_class = transformers.LlamaTokenizer
+        logger.debug("Using LlamaTokenizer")
+    else:
+        tokenizer_class = transformers.AutoTokenizer
+        logger.debug(f"Using AutoTokenizer for {model_name}")
+    
+    try:
+        tokenizer = tokenizer_class.from_pretrained(
+            model_name,
+            cache_dir=cache_dir,
+            trust_remote_code=True
+        )
+        logger.info(f"Tokenizer loaded successfully: {tokenizer_class.__name__}")
+    except Exception as e:
+        logger.error(f"Failed to load tokenizer: {e}")
+        raise
+    
+    special_tokens = {}
+    if tokenizer.eos_token is None:
+        special_tokens["eos_token"] = '</s>'
+        logger.debug("Added eos_token")
+    if tokenizer.bos_token is None:
+        tokenizer.bos_token = tokenizer.eos_token
+        logger.debug("Set bos_token to eos_token")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        logger.debug("Set pad_token to eos_token")
+    
+    if special_tokens:
+        tokenizer.add_special_tokens(special_tokens)
+    
+    tokenizer.padding_side = "left"
+    logger.debug(f"Set padding_side to: {tokenizer.padding_side}")
+    
+    return tokenizer
+
+def create_cot_tokens(
+    model_args: ModelArguments,
+    tokenizer: transformers.PreTrainedTokenizer
+) -> tuple[Dict[str, str], List[int], List[int]]:
+    logger.info(f"Creating CoT tokens: enabled")
+    logger.debug(f"Defining CoT tokens: {COT_TOKENS}")
+    
+    before_size = len(tokenizer)
+    logger.info(f"Tokenizer vocabulary before adding CoT tokens: {before_size}")
+
+    num_new = tokenizer.add_tokens(COT_TOKENS)
+    cot_token_ids = tokenizer.convert_tokens_to_ids(COT_TOKENS)
+
+    after_size = len(tokenizer)
+    logger.info(f"Tokenizer vocabulary after adding CoT tokens: {after_size}")
+    logger.info(f"Added {num_new} new token(s) to tokenizer")
+    
+    for token in COT_TOKENS:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        logger.debug(f"Token '{token}' -> ID {token_id}")
+    
+    return cot_token_ids
+
+def get_data_class(dataset_name: str):
+    if dataset_name not in DATASET_MAP:
+        error_msg = f"Dataset {dataset_name} not implemented. Available: {list(DATASET_MAP.keys())}"
+        logger.error(error_msg)
+        raise NotImplementedError(error_msg)
+    
+    logger.debug(f"Selected dataset class: {DATASET_MAP[dataset_name].__name__}")
+    return DATASET_MAP[dataset_name]
+
+def create_peft_config(model_args: ModelArguments, model_name: str) -> Optional[LoraConfig]:
+    if 'lora' not in model_args.parameter_efficient_mode:
+        logger.debug("No LoRA configuration needed")
+        return None
+    
+    logger.info(f"Creating LoRA configuration for model: {model_name}")
+    
+    target_modules = model_args.lora_target_modules
+    
+    if not target_modules:
+        if any(x in model_name.lower() for x in ['llama', 'alpaca', 'qwen']):
+            target_modules = []
+            if model_args.lora_module == 'mlp':
+                target_modules.extend(["gate_proj", "up_proj", "down_proj"])
+                logger.debug("LoRA targeting MLP layers")
+            elif model_args.lora_module == 'atten':
+                target_modules.extend(["q_proj", "k_proj", "v_proj", "o_proj"])
+                logger.debug("LoRA targeting attention layers")
+            else:
+                target_modules.extend(["q_proj", "v_proj"])
+                logger.debug("LoRA targeting q_proj and v_proj (default)")
+        elif 'gpt2' in model_name.lower():
+            target_modules = ["c_attn", "c_proj"]
+            logger.debug("LoRA targeting GPT2 layers")
+        else:
+            logger.warning(f"Unknown model architecture for {model_name}, using default target modules")
+            target_modules = ["q_proj", "v_proj"]
+    
+    logger.info(f"LoRA target modules: {target_modules}")
+    logger.info(f"LoRA configuration: r={model_args.lora_r}, alpha={model_args.lora_alpha}, dropout={model_args.lora_dropout}")
+    
+    return LoraConfig(
+        r=model_args.lora_r,
+        lora_alpha=model_args.lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=model_args.lora_dropout,
+        bias=model_args.lora_bias,
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=model_args.lora_inference_mode,
+        init_lora_weights=model_args.lora_init_lora_weights,
+        fan_in_fan_out=model_args.lora_fan_in_fan_out,
+    )
+
+def load_model(
+    model_args: ModelArguments,
+    training_args: TrainingArguments,
+    num_new_tokens: int,
+    tokenizer: transformers.PreTrainedTokenizer
+) -> torch.nn.Module:
+    model_path = model_args.model_path
+    
+    logger.info(f"Loading model from: {model_path}")
+    
+    load_kwargs = {
+        "n_tokens": num_new_tokens,
+        "parameter_efficient_mode": model_args.parameter_efficient_mode,
+        "pretrained_model_name_or_path": model_path,
+        "cache_dir": training_args.cache_dir
+    }
+    
+    logger.debug(f"Loading model with kwargs: {load_kwargs}")
+    
+    if training_args.load_in_8bit:
+        load_kwargs.update({
+            "device_map": "auto",
+            "load_in_8bit": True,
+            "offload_folder": "offload",
+            "offload_state_dict": True
+        })
+        logger.info("Loading model in 8-bit precision")
+    elif training_args.load_in_4bit:
+        load_kwargs.update({
+            "device_map": "auto",
+            "load_in_4bit": True
+        })
+        logger.info("Loading model in 4-bit precision")
+    elif training_args.fp16 or training_args.bf16:
+        dtype = torch.float16 if training_args.fp16 else torch.bfloat16
+        load_kwargs["dtype"] = dtype
+        logger.info(f"Loading model with dtype: {dtype}")
+    
+    try:
+        model = AutoCausalLM.from_pretrained(**load_kwargs)
+        input_emb_size = model.get_input_embeddings().weight.size(0)
+        tokenizer_vocab_size = len(tokenizer)
+        model_vocab_size = model.config.vocab_size
+        
+        logger.info(f"Model config vocab_size: {model_vocab_size}")
+        logger.info(f"Model input embeddings size: {input_emb_size}")
+        logger.info(f"Tokenizer vocabulary size: {tokenizer_vocab_size}")
+        
+        if input_emb_size != tokenizer_vocab_size:
+            logger.warning(f"MISMATCH: Model embeddings ({input_emb_size}) != Tokenizer vocab ({tokenizer_vocab_size})")
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}")
+        raise
+    
+    if training_args.load_in_8bit or training_args.load_in_4bit:
+        logger.info("Preparing model for k-bit training")
+        model = prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=training_args.gradient_checkpointing
+        )
+        logger.debug("Model prepared for k-bit training")
+    
+    return model
+
+def train():
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    
+    try:
+        config = load_config()
+        logger.info("Configuration loaded successfully")
+    except FileNotFoundError as e:
+        logger.warning(f"Configuration file not found: {e}")
+        config = {
+            'train': {},
+            'logging': {}
+        }
+        logger.info("Using default configuration")
+    
+    model_args = update_dataclass_from_config(model_args, config, ['common', 'train'])
+    data_args = update_dataclass_from_config(data_args, config, ['common', 'train'])
+    training_args = update_dataclass_from_config(training_args, config, ['common', 'train'])
+    
+    logger.info("Starting training process")
+    logger.info(f"Model arguments: {model_args}")
+    logger.info(f"Data arguments: {data_args}")
+    logger.info(f"Training arguments: {training_args}")
+
+    setup_directories(config)
+
+    if 'lora' in model_args.parameter_efficient_mode:
+        logger.info(f"LoRA Configuration loaded:")
+        logger.info(f"  - r: {model_args.lora_r}")
+        logger.info(f"  - alpha: {model_args.lora_alpha}")
+        logger.info(f"  - dropout: {model_args.lora_dropout}")
+        logger.info(f"  - bias: {model_args.lora_bias}")
+        logger.info(f"  - inference_mode: {model_args.lora_inference_mode}")
+        logger.info(f"  - module: {model_args.lora_module}")
+        logger.info(f"  - target_modules: {model_args.lora_target_modules}")
+        logger.info(f"  - init_lora_weights: {model_args.lora_init_lora_weights}")
+        logger.info(f"  - fan_in_fan_out: {model_args.lora_fan_in_fan_out}")
+    
+    if model_args.hf_hub_token:
+        try:
+            login(token=model_args.hf_hub_token)
+            logger.info("Successfully logged in to Hugging Face Hub")
+        except Exception as e:
+            logger.warning(f"Failed to login to Hugging Face Hub: {e}")
+    
+    tokenizer = create_tokenizer(model_args.model_path, training_args.cache_dir)
+    tokenizer.model_max_length = training_args.model_max_length
+    logger.info(f"Tokenizer configured with max length: {tokenizer.model_max_length}")
+    cot_tokens = create_cot_tokens(model_args, tokenizer)
+    if cot_tokens:
+        logger.info(f"Added {len(cot_tokens)} CoT tokens")
+    
+    try:
+        data_class = get_data_class(data_args.dataset)
+        logger.debug(f"Using dataset class: {data_class.__name__}")
+    except NotImplementedError as e:
+        logger.error(f"Dataset error: {e}")
+        return
+    
+    data_config = DataConfig()
+    datasets_config = load_datasets_config()
+    data_config.dataset = datasets_config[data_args.dataset]
+    
+    try:
+        train_dataset = data_class(data_args.dataset, "train", config=data_config)
+        logger.info(f"Successfully loaded training dataset {data_args.dataset} with {len(train_dataset)} examples")
+    except Exception as e:
+        logger.error(f"Failed to load training dataset: {e}", exc_info=True)
+        return
+    
+    try:
+        eval_dataset = data_class(data_args.dataset, "test", config=data_config)
+        logger.info(f"Evaluation dataset loaded successfully: {len(eval_dataset)} examples")
+    except Exception as e:
+        logger.error(f"Failed to load evaluation dataset: {e}")
+        eval_dataset = None
+    
+    try:
+        if data_args.mode == "supervised":
+            data_module = make_supervised_data_module(
+                tokenizer,
+                train_dataset,
+                eval_dataset,
+                max_num_eval=data_args.num_test
+            )
+            logger.info("Created supervised data module")
+        elif data_args.mode == "fixed_length":
+            data_module = make_fixed_length_data_module(
+                tokenizer,
+                train_dataset,
+                eval_dataset,
+                training_args.model_max_length
+            )
+            logger.info("Created fixed length data module")
+        else:
+            logger.error(f"Unknown mode: {data_args.mode}")
+            return
+    except Exception as e:
+        logger.error(f"Failed to create data module: {e}", exc_info=True)
+        return
+    
+    try:
+        model = load_model(model_args, training_args, len(cot_tokens), tokenizer)
+        logger.info(f"Model loaded successfully: {model_args.model_path}")
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}", exc_info=True)
+        return
+    
+    try:
+        if 'lora' in model_args.parameter_efficient_mode:
+            peft_config = create_peft_config(model_args, model_args.model_path)
+            model = PeftModelForCausalLMWrapper(model, peft_config, add_tokens=True)
+            if "prompt-tuning" in model_args.parameter_efficient_mode:
+                enable_prompt_tuning(model.base_model.model)
+                logger.info("Applied LoRA + prompt tuning")
+            else:
+                logger.info("Applied LoRA")
+        elif 'prompt-tuning' in model_args.parameter_efficient_mode:
+            for param in model.parameters():
+                param.requires_grad = False
+            enable_prompt_tuning(model)
+            logger.info("Applied prompt tuning")
+    except Exception as e:
+        logger.error(f"Failed to apply PEFT: {e}", exc_info=True)
+        return
+    
+    log_trainable_parameters(model)
+    
+    wandb_run = None
+    if config.get('logging', {}).get('wandb_project'):
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=config['logging']['wandb_project'],
+                entity=config['logging'].get('wandb_entity'),
+                name=config['experiment'].get('name', 'training-run'),
+                tags=config['experiment'].get('tags', []),
+                notes=config['experiment'].get('notes', ''),
+                config={
+                    **config['common'],
+                    **config['train'],
+                    'parameter_efficient_mode': model_args.parameter_efficient_mode,
+                    'dataset': data_args.dataset,
+                    'model': model_args.model_path
+                }
+            )
+            logger.info("WandB initialized successfully")
+        except ImportError:
+            logger.warning("WandB not installed, skipping initialization")
+        except Exception as e:
+            logger.warning(f"Failed to initialize WandB: {e}")
+    
+    try:
+        trainer = LMTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            args=training_args,
+            **data_module
+        )
+        logger.info("Trainer created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create trainer: {e}", exc_info=True)
+        return
+    
+    try:
+        if training_args.resume:
+            logger.info("Resuming training from checkpoint")
+            trainer.train(resume_from_checkpoint=True)
+            logger.info("Training resumed successfully")
+        else:
+            logger.info("Starting new training session")
+            trainer.train()
+            logger.info("Training completed successfully")
+    except Exception as e:
+        logger.error(f"Error during training: {e}", exc_info=True)
+        if wandb_run:
+            wandb_run.finish()
+        return
+    
+    try:
+        trainer.save_state()
+        trainer.save_model(output_dir=str(training_args.checkpoint_dir))
+        logger.info(f"Model saved successfully to: {training_args.checkpoint_dir}")
+    except Exception as e:
+        logger.error(f"Failed to save model: {e}", exc_info=True)
+    
+    try:
+        config_output_path = training_args.checkpoint_dir / 'training_config.yaml'
+        import yaml
+        with open(config_output_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
+        logger.info(f"Training config saved to: {config_output_path}")
+    except Exception as e:
+        logger.error(f"Failed to save training config: {e}")
+    
+    if wandb_run:
+        wandb_run.finish()
+        logger.info("WandB run finished")
+    
+    logger.info(f"Model: {model_args.model_path}")
+    logger.info(f"Model saved at: {training_args.checkpoint_dir}")
+    logger.info(f"Output directory: {training_args.output_dir}")
+
+if __name__ == "__main__":
+    train()
