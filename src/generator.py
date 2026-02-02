@@ -18,7 +18,7 @@ from config import (
 @dataclass
 class GeneratorArguments:
     dataset: str = field(
-        default="truthful_qa",
+        default="truthfulqa",
         metadata={
             "choices": dataset_names,
             "help": "Dataset to generate CoT data for"
@@ -1257,8 +1257,7 @@ class DatasetGenerator:
             logger.error(f"Error loading dataset {source} split {actual_split}: {e}")
             raise
     
-    def get_output_filename(self, split: str, clean: bool = False) -> Path:
-        """Generate output filename for the generated dataset."""
+    def get_output_filename(self, split: str) -> Path:
         if self.dataset_name:
             base_name = f"{self.dataset_name}_{split}"
         else:
@@ -1266,9 +1265,6 @@ class DatasetGenerator:
             base_name = f"{dataset_name}_{split}"
         
         base_name = base_name.lower()
-        
-        if clean:
-            return self.output_dir / f"{base_name}_filtered.json"
         
         return self.output_dir / f"{base_name}.json"
     
@@ -1364,8 +1360,7 @@ class DatasetGenerator:
             
             return question, answer
         except Exception as e:
-            logger.error(f"Error formatting example: {e}")
-            logger.debug(f"Example: {example}")
+            logger.warning(f"Error formatting example: {e}")
             raise
     
     def _get_field(self, example: Dict, field_name: str) -> Any:
@@ -1692,10 +1687,14 @@ class DatasetGenerator:
         example_objs = []
         
         for example in examples:
-            question, answer = self._format_question_and_answer_internal(example)
-            questions.append(question)
-            answers.append(answer)
-            example_objs.append((question, answer, example))
+            try:
+                question, answer = self._format_question_and_answer_internal(example)
+                questions.append(question)
+                answers.append(answer)
+                example_objs.append((question, answer, example))
+            except Exception as e:
+                logger.warning(f"Failed to process example: {example}")
+                continue
         
         logger.info(f"Batch generating CoT steps for {len(questions)} examples")
         
@@ -1748,7 +1747,7 @@ class DatasetGenerator:
                     if self.incremental_save and (i + 1) % self.incremental_save_interval == 0:
                         self.save_results(results, output_file)
                 except Exception as e:
-                    logger.error(f"Failed to process test example {i}: {e}")
+                    logger.warning(f"Failed to process test example {i}: {e}")
                     continue
         else:
             use_batch = self._should_use_batch_processing(split, backend)
@@ -1774,7 +1773,7 @@ class DatasetGenerator:
                                 processed = self.process_example(example, split)
                                 results.append(processed)
                             except Exception as e2:
-                                logger.error(f"Failed to process individual example: {e2}")
+                                logger.warning(f"Failed to process individual example: {e2}")
                                 continue
             else:
                 logger.info(f"Processing {split} examples individually")
@@ -1786,7 +1785,7 @@ class DatasetGenerator:
                         if self.incremental_save and (i + 1) % self.incremental_save_interval == 0:
                             self.save_results(results, output_file)
                     except Exception as e:
-                        logger.error(f"Failed to process example {i}: {e}")
+                        logger.warning(f"Failed to process example {i}: {e}")
                         continue
         
         self.save_results(results, output_file)
@@ -1794,7 +1793,7 @@ class DatasetGenerator:
         if self.filter_output and split != "test":
             logger.info(f"Filtering {split} results")
             results = self.filter_results(results, split)
-            output_file = self.get_output_filename(split, clean=True)
+            output_file = self.get_output_filename(split)
             self.save_results(results, output_file)
         
         logger.info(f"Generated {len(results)} examples for {self.dataset_name} {split}")

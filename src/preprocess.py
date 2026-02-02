@@ -799,11 +799,7 @@ class BaseData(Dataset, ABC):
 
 class JsonBasedData(BaseData):
     def __init__(self, name: str, split: str, config: DataConfig):
-        if split == 'train':
-            self.json_path_pattern = str(DEFAULT_DATA_DIR / f"{name}_{split}_filtered.json")
-        else:
-            self.json_path_pattern = str(DEFAULT_DATA_DIR / f"{name}_{split}.json")
-        
+        self.json_path_pattern = str(DEFAULT_DATA_DIR / f"{name}_{split}.json")
         logger.debug(f"JSON path pattern: {self.json_path_pattern}")
         super().__init__(name, split, config)
     

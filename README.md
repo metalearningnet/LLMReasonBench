@@ -19,14 +19,44 @@ Get started in minutes:
 ./install.sh
 
 # Generate Chain-of-Thought data (TruthfulQA example)
-./run.sh --generate --dataset truthful_qa --mode train
+./run.sh --generate --dataset truthfulqa --mode train
 
 # Train your model
-./run.sh --train --dataset truthful_qa
+./run.sh --train --dataset truthfulqa
 
 # Evaluate performance
-./run.sh --eval --model-path <your_model_path> --dataset truthful_qa
+./run.sh --eval --model-path <your_model_path> --dataset truthfulqa
 ```
+
+## Direct Dataset Download
+
+ReasonBench provides a convenient script to download and prepare datasets directly from Hugging Face. This is useful if you want to use a dataset that is available on Hugging Face but not pre-configured in ReasonBench.
+
+### Usage
+
+To download a dataset, use the `install.sh` script with the `--dataset` and `--name` arguments:
+
+```bash
+./install.sh --dataset <huggingface_dataset_identifier> --name <output_name>
+```
+
+For example, to download the MetaMathQA dataset:
+
+```bash
+./install.sh --dataset metalearningnet/qwen3-metamathqa-cot --name metamathqa
+```
+
+This will download the dataset and save it as `data/metamathqa_train.json`.
+
+### Important Notes
+
+1. **Direct Use for Training and Evaluation**: Datasets downloaded via this method are saved in the ReasonBench JSON format and can be used directly for training and evaluation without requiring the additional generation step (`./run.sh --generate`).
+
+2. **Configuration Still Required**: To use the downloaded dataset for training or evaluation, you still need to:
+   - Add a configuration entry in `conf/datasets.yaml`
+   - Create a corresponding dataset class in `src/dataset/` (see "Adding Custom Datasets" section below)
+
+3. **Format Compatibility**: The downloaded data is already in the required JSON format and includes the necessary fields for ReasonBench processing.
 
 ## Configuration
 
@@ -69,7 +99,7 @@ Configure datasets in `conf/datasets.yaml`. Here are examples for each answer ty
 
 ```yaml
 # Boolean answer type example:
-strategy_qa:
+strategyqa:
   source: "ChilleD/StrategyQA"
   split_mapping:
     train: "train"
@@ -81,7 +111,7 @@ strategy_qa:
   clean_latex: false
 
 # Multiple choice answer type example:
-commonsense_qa:
+commonsenseqa:
   source: "tau/commonsense_qa"
   split_mapping:
     train: "train"
@@ -128,8 +158,8 @@ Each dataset configuration supports the following fields:
 
 ### Special Token Behavior
 
-- **Memory Steps** (`MEMORY_TOKEN_NAME`): Extract only given facts without any reasoning
-- **Reason Steps** (`REASON_TOKEN_NAME`): Perform calculations using facts from memory steps
+- **Memory Steps**: Extract only given facts without any reasoning
+- **Reason Steps**: Perform calculations using facts from memory steps
 - **Chain-of-Thought**: Combines both memory and reason tokens for structured reasoning
 
 ### Additional Settings
@@ -149,10 +179,10 @@ Edit `conf/settings.yaml` to customize:
 | AIME25 | `aime25` | Numeric | `math-ai/aime25` |
 | AQUA-RAT | `aqua` | Multiple Choice | `deepmind/aqua_rat` |
 | MMLU-Pro | `mmlupro` | Multiple Choice | `TIGER-Lab/MMLU-Pro` |
-| TruthfulQA | `truthful_qa` | Multiple Choice | `truthfulqa/truthful_qa` |
-| StrategyQA | `strategy_qa` | Boolean | `ChilleD/StrategyQA` |
-| MetaMathQA | `metamath_qa` | Numeric | `meta-math/MetaMathQA` |
-| CommonsenseQA | `commonsense_qa` | Multiple Choice | `tau/commonsense_qa` |
+| TruthfulQA | `truthfulqa` | Multiple Choice | `truthfulqa/truthful_qa` |
+| StrategyQA | `strategyqa` | Boolean | `ChilleD/StrategyQA` |
+| MetaMathQA | `metamathqa` | Numeric | `meta-math/MetaMathQA` |
+| CommonsenseQA | `commonsenseqa` | Multiple Choice | `tau/commonsense_qa` |
 
 ## Adding Custom Datasets
 
@@ -194,6 +224,8 @@ class YourDataset(JsonBasedData):
 ```
 
 The dataset class should implement the `get_instruction()` method to provide dataset-specific instructions. The `JsonBasedData` base class handles JSON-formatted data loading and preprocessing.
+
+**Note**: Even if you download a dataset directly using the `./install.sh --dataset` command, you still need to complete both steps above to use the dataset for training or evaluation.
 
 ## License
 

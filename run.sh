@@ -51,10 +51,10 @@ Supported Datasets:
   aime25           AIME25
   aqua             AQUA-RAT
   mmlupro          MMLU-Pro
-  truthful_qa      TruthfulQA
-  strategy_qa      StrategyQA
-  metamath_qa      MetaMathQA
-  commonsense_qa   CommonsenseQA
+  truthfulqa       TruthfulQA
+  strategyqa       StrategyQA
+  metamathqa       MetaMathQA
+  commonsenseqa    CommonsenseQA
   
 Generator Options:
   --dataset DATASET       Dataset to generate (see Supported Datasets)
@@ -78,9 +78,9 @@ Evaluation Options:
   --num-test NUM          Number of test examples
 
 Examples:
-  $0 --generate --dataset truthful_qa --mode train
-  $0 --train --dataset truthful_qa --model-path Qwen/Qwen3-4B
-  $0 --eval --dataset truthful_qa --model-path $CHECKPOINT_DIR
+  $0 --generate --dataset truthfulqa --mode train
+  $0 --train --dataset truthfulqa --model-path Qwen/Qwen3-4B
+  $0 --eval --dataset truthfulqa --model-path $CHECKPOINT_DIR
 
 EOF
 }

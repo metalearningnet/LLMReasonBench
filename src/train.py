@@ -1,10 +1,10 @@
 import torch
 import transformers
 from dataset import DATASET_MAP
-from lm_trainer import LMTrainer
+from trainer.lm import LMTrainer
 from preprocess import DataConfig
 from huggingface_hub import login
-from load_model import AutoCausalLM
+from model_loader import AutoCausalLM
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 from peft_model import PeftModelForCausalLMWrapper
@@ -59,7 +59,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     dataset: str = field(
-        default="truthful_qa",
+        default="truthfulqa",
         metadata={
             "help": "Dataset name.",
             "choices": dataset_names

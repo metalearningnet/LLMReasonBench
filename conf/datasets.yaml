@@ -1,4 +1,4 @@
-strategy_qa:
+strategyqa:
   source: "ChilleD/StrategyQA"
   split_mapping:
     train: "train"
@@ -9,7 +9,7 @@ strategy_qa:
     answer: "answer"
   clean_latex: false
 
-commonsense_qa:
+commonsenseqa:
   source: "tau/commonsense_qa"
   split_mapping:
     train: "train"
@@ -22,7 +22,7 @@ commonsense_qa:
     choices: "choices"
   clean_latex: false
 
-truthful_qa:
+truthfulqa:
   source: "truthfulqa/truthful_qa"
   config_name: "multiple_choice"
   split_mapping:
@@ -36,7 +36,7 @@ truthful_qa:
     choices: "mc1_targets"
   clean_latex: false
 
-metamath_qa:
+metamathqa:
   source: "meta-math/MetaMathQA"
   split_mapping:
     train: "train"

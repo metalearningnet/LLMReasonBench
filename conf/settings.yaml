@@ -1,9 +1,9 @@
 common:
-  model_path: "Qwen/Qwen3-1.7B"             # Base model to use
-  dataset: "truthful_qa"                    # Default dataset
+  model_path: "Qwen/Qwen3-30B-A3B-Instruct-2507" # Base model to use
+  dataset: "truthfulqa"                     # Default dataset
   hf_hub_token: ""                          # Hugging Face token
   batch_size: 1                             # Batch size for training or evaluation
-  max_length: 1024                          # Maximum sequence length
+  max_length: 2048                          # Maximum sequence length
   load_in_8bit: false                       # Load model in 8-bit quantization
   load_in_4bit: false                       # Load model in 4-bit quantization
   seed: 42                                  # Random seed for reproducibility
@@ -44,25 +44,23 @@ train:
   fp16: true                                # Use mixed precision training
 
 generator:
-  backend: "openai"                         # 'openai' | 'vllm'
+  backend: "vllm"                           # 'openai' | 'vllm'
   mode: "train"                             # Default mode for generation
-  max_tokens: 1024                          # Maximum number of tokens to generate in the completion
-  temperature: 0.3                          # Temperature for generation (0.0-2.0)
+  max_tokens: 2048                          # Maximum number of tokens to generate in the completion
+  temperature: 0.3                          # Temperature for generation
   top_p: 1.0                                # Nucleus sampling parameter
   frequency_penalty: 0.0                    # Frequency penalty
   presence_penalty: 0.0                     # Presence penalty
   stop_sequences: []                        # Stop sequences for generation
-  train_split_ratio: 0.8                    # Train split ratio
   incremental_save: false                   # Save results incrementally
   min_memory_steps: 0                       # Minimum number of <memory> steps (factual knowledge retrieval) required in each CoT
   min_reason_steps: 1                       # Minimum number of <reason> steps (logical reasoning) required in each CoT
   max_cot_validation_attempts: 3            # Maximum number of attempts to validate and regenerate CoT steps for each example
   max_generation_attempts: 3                # Maximum number of retries for generating a qualified example with valid CoT steps
   require_memory_before_reason: false       # Whether to require at least one <memory> (factual knowledge) step before any <reason> (reasoning) steps
-  token_order_requirements: false           # Whether to retuire earlier token steps must come before later token steps
   require_both_memory_reason: false         # Whether to require both <memory> and <reason> step types in each CoT
   validate_cot_steps: true                  # Whether to validate the quality and structure of generated Chain-of-Thought steps
-  batch_size: 16                            # Batch size for generation
+  batch_size: 64                            # Batch size for generation
   max_retries: 1                            # Maximum number of retry attempts
 
   llm_api:                                  # OpenAI API configuration (used when backend='openai')
@@ -74,8 +72,8 @@ generator:
     retry_max_wait: 60                      # Maximum wait between retries (seconds)
 
   vllm:                                     # vLLM configuration (used when backend='vllm')
-    model: "Qwen/Qwen3-1.7B"                # Path to local model or HuggingFace model name
-    max_model_len: 1024                     # Maximum model context length
+    model: "Qwen/Qwen3-30B-A3B-Instruct-2507" # Path to local model or HuggingFace model name
+    max_model_len: 2560                     # Maximum model context length
     seed: 42                                # Random seed for reproducibility
     tensor_parallel_size: 1                 # Tensor parallelism (number of GPUs)
     gpu_memory_utilization: 0.8             # GPU memory utilization (0.0-1.0)

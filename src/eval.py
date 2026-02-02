@@ -11,7 +11,7 @@ from dataset import DATASET_MAP
 from huggingface_hub import login
 from preprocess import DataConfig
 from train import create_cot_tokens
-from load_model import AutoCausalLM
+from model_loader import AutoCausalLM
 from torch.utils.data import DataLoader, Subset
 from dataclasses import dataclass, field, asdict
 from peft_model import PeftModelForCausalLMWrapper

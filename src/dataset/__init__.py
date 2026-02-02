@@ -35,10 +35,10 @@ GENERATOR_MAP = {
     'aime24': AIME24Generator,
     'aime25': AIME25Generator,
     'mmlupro': MMLUProGenerator,
-    'strategy_qa': StrategyQAGenerator,
-    'truthful_qa': TruthfulQAGenerator,
-    'metamath_qa': MetaMathQAGenerator,
-    'commonsense_qa': CommonsenseQAGenerator
+    'strategyqa': StrategyQAGenerator,
+    'truthfulqa': TruthfulQAGenerator,
+    'metamathqa': MetaMathQAGenerator,
+    'commonsenseqa': CommonsenseQAGenerator
 }
 
 DATASET_MAP = {
@@ -47,8 +47,8 @@ DATASET_MAP = {
     'aime24': AIME24,
     'aime25': AIME25,
     'mmlupro': MMLUPro,
-    'strategy_qa': StrategyQA,
-    'truthful_qa': TruthfulQA,
-    'metamath_qa': MetaMathQA,
-    'commonsense_qa': CommonsenseQA
+    'strategyqa': StrategyQA,
+    'truthfulqa': TruthfulQA,
+    'metamathqa': MetaMathQA,
+    'commonsenseqa': CommonsenseQA
 }

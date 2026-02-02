@@ -1,6 +1,8 @@
 #!/bin/bash
 
-set -euo pipefail
+readonly DATASET_LOADER_SCRIPT="src/dataset_loader.py"
+readonly DEFAULT_OUTPUT_DIR="data"
+readonly MD_TARGET_DIR="./targets/md"
 
 if [[ -t 1 ]]; then
     readonly BOLD=$(tput bold 2>/dev/null || echo)
@@ -30,109 +32,416 @@ log_error() {
     exit 1
 }
 
-INSTALL_MD=false
-MD_SOURCE_PATH=""
-SKIP_PACKAGES=false
+INSTALL_PACKAGES=false
+INSTALL_MODEL=false
+INSTALL_DATASET=false
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --md)
-            INSTALL_MD=true
-            SKIP_PACKAGES=true
-            shift
-            ;;
-        --path)
-            if [[ -n $2 ]]; then
-                if [[ "$INSTALL_MD" == false ]]; then
-                    log_error "--path argument must follow --md argument"
+MODEL_NAME=""
+MODEL_SOURCE_PATH=""
+
+DATASET_PATH=""
+DATASET_NAME=""
+DATASET_SPLIT="train"
+DATASET_MAX_LENGTH=""
+DATASET_CONFIG=""
+DATASET_SHUFFLE=false
+DATASET_SEED=42
+DATASET_STREAMING=false
+DATASET_INDENT=4
+DATASET_OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
+
+show_usage() {
+    cat << EOF
+Usage: $0 [OPTIONS]
+
+This script supports three distinct installation options:
+
+DEFAULT BEHAVIOR (no arguments): Installs all Python packages.
+
+============================================================================
+COMMAND LINE OPTIONS
+============================================================================
+
+Package Installation (Default):
+  (no arguments)               Install all Python packages
+  --help, -h                   Show this help message
+
+Model Installation:
+  --model MODEL                [Required] Model name to install (currently only 'md' supported)
+  --path PATH                  Local path to model (requires --model)
+
+Dataset Installation:
+  --dataset DATASET            [Required] Hugging Face dataset identifier
+                               Example: 'metalearningnet/qwen3-metamathqa-cot'
+s
+  --name NAME                  [Required] Output filename (without extension)
+                               Example: 'metamathqa' -> creates 'metamathqa_train.json'
+
+  --split SPLIT                Dataset split to download (default: 'train')
+
+  --max-length LENGTH          Limit number of examples (for testing/debugging)
+
+  --config CONFIG              Configuration name for multi-configuration datasets
+
+  --shuffle                    Shuffle dataset before truncating
+
+  --seed SEED                  Random seed for shuffling (default: 42)
+
+  --streaming                  Use streaming mode for large datasets
+
+  --indent INDENT              JSON indentation level (default: 4)
+
+  --output-dir DIR             Directory to save downloaded dataset (default: 'data')
+
+============================================================================
+EXAMPLES
+============================================================================
+
+Package Installation:
+  ./install.sh                    # Install all Python packages
+
+Model Installation:
+  ./install.sh --model md         # Install MD model from GitHub
+  ./install.sh --model md --path /path/to/local/md  # Install from local directory
+
+Dataset Installation:
+  ./install.sh --dataset metalearningnet/qwen3-metamathqa-cot --name metamathqa
+
+EOF
+}
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --model)
+                if [[ -n ${2:-} ]]; then
+                    INSTALL_MODEL=true
+                    MODEL_NAME="$2"
+                    shift 2
+                else
+                    log_error "--model requires a value"
                 fi
-                MD_SOURCE_PATH="$2"
-                shift 2
-            else
-                log_error "--path requires a value"
-            fi
-            ;;
-        -*)
-            log_warning "Unknown option: $1"
-            shift
-            ;;
-        *)
-            shift
-            ;;
-    esac
-done
+                ;;
+            --path)
+                if [[ -n ${2:-} ]]; then
+                    if [[ "$INSTALL_MODEL" == false ]]; then
+                        log_error "--path argument must follow --model argument"
+                    fi
+                    MODEL_SOURCE_PATH="$2"
+                    shift 2
+                else
+                    log_error "--path requires a value"
+                fi
+                ;;
+            --dataset)
+                if [[ -n ${2:-} ]]; then
+                    INSTALL_DATASET=true
+                    DATASET_PATH="$2"
+                    shift 2
+                else
+                    log_error "--dataset requires a value"
+                fi
+                ;;
+            --name)
+                if [[ -n ${2:-} ]]; then
+                    DATASET_NAME="$2"
+                    shift 2
+                else
+                    log_error "--name requires a value"
+                fi
+                ;;
+            --split)
+                if [[ -n ${2:-} ]]; then
+                    DATASET_SPLIT="$2"
+                    shift 2
+                else
+                    log_error "--split requires a value"
+                fi
+                ;;
+            --max-length)
+                if [[ -n ${2:-} ]]; then
+                    if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+                        log_error "--max-length must be a positive integer"
+                    fi
+                    DATASET_MAX_LENGTH="$2"
+                    shift 2
+                else
+                    log_error "--max-length requires a value"
+                fi
+                ;;
+            --config)
+                if [[ -n ${2:-} ]]; then
+                    DATASET_CONFIG="$2"
+                    shift 2
+                else
+                    log_error "--config requires a value"
+                fi
+                ;;
+            --shuffle)
+                DATASET_SHUFFLE=true
+                shift
+                ;;
+            --seed)
+                if [[ -n ${2:-} ]]; then
+                    if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+                        log_error "--seed must be a positive integer"
+                    fi
+                    DATASET_SEED="$2"
+                    shift 2
+                else
+                    log_error "--seed requires a value"
+                fi
+                ;;
+            --streaming)
+                DATASET_STREAMING=true
+                shift
+                ;;
+            --indent)
+                if [[ -n ${2:-} ]]; then
+                    if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+                        log_error "--indent must be a non-negative integer"
+                    fi
+                    DATASET_INDENT="$2"
+                    shift 2
+                else
+                    log_error "--indent requires a value"
+                fi
+                ;;
+            --output-dir)
+                if [[ -n ${2:-} ]]; then
+                    DATASET_OUTPUT_DIR="$2"
+                    shift 2
+                else
+                    log_error "--output-dir requires a value"
+                fi
+                ;;
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+            -*)
+                log_error "Unknown option: $1 (use --help for usage information)"
+                ;;
+            *)
+                log_error "Unexpected argument: $1 (use --help for usage information)"
+                ;;
+        esac
+    done
+}
 
-package_list=(
-    vllm absl-py accelerate aiohappyeyeballs aiohttp aiosignal
-    altair annotated-types anyio asttokens async-timeout
-    attrs bitsandbytes blessed blinker cachetools
-    certifi chanfig charset-normalizer click coloredlogs
-    comm contourpy cycler danling datasets
-    debugpy decorator dill distro docker-pycreds
-    einops exceptiongroup executing filelock fonttools
-    frozenlist fsspec gitdb GitPython gpustat
-    grpcio h11 httpcore httpx huggingface-hub
-    humanfriendly idna importlib_metadata importlib_resources ipykernel
-    ipython jedi Jinja2 jiter joblib
-    jsonlines jsonschema jsonschema-specifications jupyter_client jupyter_core
-    kiwisolver lazy-imports Markdown markdown-it-py MarkupSafe
-    matplotlib matplotlib-inline mdurl mpmath multidict
-    multimolecule multiprocess narwhals nest-asyncio networkx
-    nltk numpy openai optimum packaging
-    pandas parso peft pexpect pillow
-    platformdirs prompt_toolkit protobuf psutil ptyprocess
-    pure_eval pyarrow pydantic pydantic_core pydeck
-    Pygments pyparsing python-dateutil pytz PyYAML
-    pyzmq referencing regex requests rich
-    rpds-py safetensors scikit-learn scipy seaborn
-    sentence-transformers sentencepiece sentry-sdk seqeval setproctitle
-    six smmap sniffio stack-data streamlit
-    StrEnum sympy tenacity tensorboard tensorboard-data-server
-    threadpoolctl tokenizers toml torch torchaudio
-    torchvision tornado tqdm traitlets transformers
-    triton typing_extensions tzdata urllib3 wandb
-    watchdog wcwidth Werkzeug xxhash yarl zipp
-)
+validate_arguments() {
+    local mode_count=0
+    [[ "${INSTALL_MODEL}" == "true" ]] && ((mode_count++))
+    [[ "${INSTALL_DATASET:-}" == "true" ]] && ((mode_count++))
 
-if [[ "$SKIP_PACKAGES" == false ]]; then
-    log_info "Starting package installation..."
-    
+    if [[ $mode_count -gt 1 ]]; then
+        log_error "Cannot combine --model and --dataset in the same command. Please choose one mode."
+    fi
+
+    if [[ $mode_count -eq 0 ]]; then
+        INSTALL_PACKAGES=true
+    fi
+
+    if [[ "${INSTALL_DATASET:-}" == true ]]; then
+        if [[ -z "${DATASET_PATH:-}" ]]; then
+            log_error "Dataset path is required when using --dataset"
+        fi
+        if [[ -z "${DATASET_NAME:-}" ]]; then
+            log_error "--name is required when using --dataset"
+        fi
+    fi
+
+    if [[ "${INSTALL_MODEL:-}" == true ]]; then
+        if [[ -z "${MODEL_NAME:-}" ]]; then
+            log_error "Model name is required when using --model"
+        fi
+        if [[ "$MODEL_NAME" != "md" ]]; then
+            log_error "Currently only 'md' model is supported. You specified: $MODEL_NAME"
+        fi
+    fi
+}
+
+install_packages() {
+    log_info "Installing Python packages..."
+
+    package_list=(
+        vllm absl-py accelerate aiohappyeyeballs aiohttp aiosignal
+        altair annotated-types anyio asttokens async-timeout
+        attrs bitsandbytes blessed blinker cachetools
+        certifi chanfig charset-normalizer click coloredlogs
+        comm contourpy cycler danling datasets
+        debugpy decorator dill distro docker-pycreds
+        einops exceptiongroup executing filelock fonttools
+        frozenlist fsspec gitdb GitPython gpustat
+        grpcio h11 httpcore httpx huggingface-hub
+        humanfriendly idna importlib_metadata importlib_resources ipykernel
+        ipython jedi Jinja2 jiter joblib
+        jsonlines jsonschema jsonschema-specifications jupyter_client jupyter_core
+        kiwisolver lazy-imports Markdown markdown-it-py MarkupSafe
+        matplotlib matplotlib-inline mdurl mpmath multidict
+        multimolecule multiprocess narwhals nest-asyncio networkx
+        nltk numpy openai optimum packaging
+        pandas parso peft pexpect pillow
+        platformdirs prompt_toolkit protobuf psutil ptyprocess
+        pure_eval pyarrow pydantic pydantic_core pydeck
+        Pygments pyparsing python-dateutil pytz PyYAML
+        pyzmq referencing regex requests rich
+        rpds-py safetensors scikit-learn scipy seaborn
+        sentence-transformers sentencepiece sentry-sdk seqeval setproctitle
+        six smmap sniffio stack-data streamlit
+        StrEnum sympy tenacity tensorboard tensorboard-data-server
+        threadpoolctl tokenizers toml torch torchaudio
+        torchvision tornado tqdm traitlets transformers
+        triton typing_extensions tzdata urllib3 wandb
+        watchdog wcwidth Werkzeug xxhash yarl zipp
+    )
+
+    log_info "Upgrading pip..."
+    pip install --upgrade pip
+
+    log_info "Installing ${#package_list[@]} packages..."
     if pip install "${package_list[@]}"; then
-        log_success "All packages installed successfully"
+        log_info "All packages installed successfully"
     else
         log_error "Failed to install packages"
     fi
-fi
+}
 
-if [[ "$INSTALL_MD" == true ]]; then
-    TARGET_DIR="./targets/md"
-    
-    mkdir -p "$(dirname "$TARGET_DIR")"
-    
-    if [[ -d "$TARGET_DIR" ]]; then
-        log_warning "Removing existing MD directory at $TARGET_DIR"
-        rm -rf "$TARGET_DIR"
+install_model() {
+    log_info "Installing $MODEL_NAME model..."
+
+    if [[ "$MODEL_NAME" != "md" ]]; then
+        log_error "Currently only 'md' model is supported"
     fi
-    
-    if [[ -n "$MD_SOURCE_PATH" ]]; then
-        if [[ -d "$MD_SOURCE_PATH" ]]; then
-            log_info "Copying MD model from $MD_SOURCE_PATH to $TARGET_DIR"
-            cp -r "$MD_SOURCE_PATH" "$TARGET_DIR"
+
+    mkdir -p "$(dirname "$MD_TARGET_DIR")"
+
+    if [[ -d "$MD_TARGET_DIR" ]]; then
+        log_warning "Removing existing MD directory at $MD_TARGET_DIR"
+        rm -rf "$MD_TARGET_DIR"
+    fi
+
+    if [[ -n "$MODEL_SOURCE_PATH" ]]; then
+        if [[ -d "$MODEL_SOURCE_PATH" ]]; then
+            log_info "Copying $MODEL_NAME model from $MODEL_SOURCE_PATH to $MD_TARGET_DIR"
+            cp -r "$MODEL_SOURCE_PATH" "$MD_TARGET_DIR"
         else
-            log_error "Local MD path $MD_SOURCE_PATH does not exist or is not a directory"
+            log_error "Local $MODEL_NAME path $MODEL_SOURCE_PATH does not exist or is not a directory"
         fi
     else
-        log_info "Cloning MD model from GitHub to $TARGET_DIR"
-        if git clone https://github.com/metalearningnet/md.git "$TARGET_DIR"; then
-            log_success "MD model cloned successfully"
+        log_info "Cloning $MODEL_NAME model from GitHub to $MD_TARGET_DIR"
+        if git clone https://github.com/metalearningnet/md.git "$MD_TARGET_DIR"; then
+            log_info "$MODEL_NAME model cloned successfully"
         else
-            log_error "Failed to clone MD model from GitHub"
+            log_error "Failed to clone $MODEL_NAME model from GitHub"
         fi
     fi
-    
-    if [[ -d "$TARGET_DIR" ]]; then
-        log_success "MD model successfully installed to $TARGET_DIR"
+
+    if [[ -d "$MD_TARGET_DIR" ]]; then
+        log_info "$MODEL_NAME model successfully installed to $MD_TARGET_DIR"
     else
-        log_error "Failed to install MD model"
+        log_error "Failed to install $MODEL_NAME model"
     fi
-fi
+}
+
+install_dataset() {
+    log_info "Downloading dataset..."
+
+    if [[ ! -f "$DATASET_LOADER_SCRIPT" ]]; then
+        log_error "Dataset loader script not found: $DATASET_LOADER_SCRIPT"
+    fi
+
+    log_info "Dataset configuration:"
+    log_info "  Dataset identifier: $DATASET_PATH"
+    log_info "  Output filename: ${DATASET_NAME}_${DATASET_SPLIT}.json"
+    log_info "  Target split: $DATASET_SPLIT"
+    log_info "  Output directory: $DATASET_OUTPUT_DIR"
+    [[ -n "$DATASET_MAX_LENGTH" ]] && log_info "  Maximum examples: $DATASET_MAX_LENGTH"
+    [[ -n "$DATASET_CONFIG" ]] && log_info "  Configuration: $DATASET_CONFIG"
+    [[ "$DATASET_SHUFFLE" == true ]] && log_info "  Shuffle: enabled (seed: $DATASET_SEED)"
+    [[ "$DATASET_STREAMING" == true ]] && log_info "  Streaming mode: enabled"
+
+    local CMD_ARGS=(
+        "--dataset" "$DATASET_PATH"
+        "--name" "$DATASET_NAME"
+        "--split" "$DATASET_SPLIT"
+        "--output_dir" "$DATASET_OUTPUT_DIR"
+        "--indent" "$DATASET_INDENT"
+        "--seed" "$DATASET_SEED"
+    )
+
+    [[ -n "$DATASET_MAX_LENGTH" ]] && CMD_ARGS+=("--max_length" "$DATASET_MAX_LENGTH")
+    [[ -n "$DATASET_CONFIG" ]] && CMD_ARGS+=("--config_name" "$DATASET_CONFIG")
+    [[ "$DATASET_SHUFFLE" == true ]] && CMD_ARGS+=("--shuffle")
+    [[ "$DATASET_STREAMING" == true ]] && CMD_ARGS+=("--streaming")
+
+    log_info "Executing: python $DATASET_LOADER_SCRIPT ${CMD_ARGS[*]}"
+
+    if python "$DATASET_LOADER_SCRIPT" "${CMD_ARGS[@]}"; then
+        local OUTPUT_FILE="${DATASET_OUTPUT_DIR}/${DATASET_NAME}_${DATASET_SPLIT}.json"
+        if [[ -f "$OUTPUT_FILE" ]]; then
+            local FILE_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
+            if command -v jq &> /dev/null; then
+                local SAMPLE_COUNT=$(jq length "$OUTPUT_FILE")
+                log_info "Dataset successfully downloaded:"
+                log_info "  File: $OUTPUT_FILE"
+                log_info "  Size: $FILE_SIZE"
+                log_info "  Examples: $SAMPLE_COUNT"
+            else
+                log_info "Dataset successfully downloaded:"
+                log_info "  File: $OUTPUT_FILE"
+                log_info "  Size: $FILE_SIZE"
+                log_info "  Examples: (install 'jq' to count: 'sudo apt install jq' or 'brew install jq')"
+            fi
+        else
+            local ALTERNATIVE_FILE="${DATASET_OUTPUT_DIR}/${DATASET_NAME}.json"
+            if [[ -f "$ALTERNATIVE_FILE" ]]; then
+                local FILE_SIZE=$(du -h "$ALTERNATIVE_FILE" | cut -f1)
+                if command -v jq &> /dev/null; then
+                    local SAMPLE_COUNT=$(jq length "$ALTERNATIVE_FILE")
+                    log_info "Dataset successfully downloaded:"
+                    log_info "  File: $ALTERNATIVE_FILE"
+                    log_info "  Size: $FILE_SIZE"
+                    log_info "  Examples: $SAMPLE_COUNT"
+                else
+                    log_info "Dataset successfully downloaded:"
+                    log_info "  File: $ALTERNATIVE_FILE"
+                    log_info "  Size: $FILE_SIZE"
+                fi
+            else
+                log_warning "Dataset download completed but output file not found."
+                log_warning "Expected: $OUTPUT_FILE or $ALTERNATIVE_FILE"
+            fi
+        fi
+    else
+        log_error "Failed to download dataset. Check the error messages above."
+    fi
+}
+
+main() {
+    parse_arguments "$@"
+
+    validate_arguments
+
+    if [[ "$INSTALL_PACKAGES" == true ]]; then
+        install_packages
+    elif [[ "$INSTALL_MODEL" == true ]]; then
+        install_model
+    elif [[ "$INSTALL_DATASET" == true ]]; then
+        install_dataset
+    fi
+
+    show_summary
+}
+
+show_summary() {
+    if [[ "$INSTALL_DATASET" == true ]]; then
+        log_success "Dataset installation completed successfully!"
+    elif [[ "$INSTALL_MODEL" == true ]]; then
+        log_success "Model installation completed successfully!"
+    elif [[ "$INSTALL_PACKAGES" == true ]]; then
+        log_success "Package installation completed successfully!"
+    fi
+}
+
+main "$@"
