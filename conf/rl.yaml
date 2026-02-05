@@ -1,0 +1,30 @@
+training_mode: "dpo" # "dpo" | "grpo"
+
+dpo:
+  dataset: "metalearningnet/qwen3-metamathqa"
+  dataset_format: "preference_pairs" # "preference_pairs" | "sharegpt"
+
+  loss_type: "sigmoid" # "sigmoid" | "hinge" | "ipo" | "kto"
+
+  field_mappings:
+    prompt: "prompt"
+    chosen: "chosen"
+    rejected: "rejected"
+
+  beta: 0.1
+
+grpo:
+  dataset: "metalearningnet/qwen3-metamathqa-rewards"
+  dataset_format: "multi_answer_scored" # "multi_answer_scored" | "prompts_only"
+
+  field_mappings:
+    answer_fields:
+      prefix: "A"
+      count: 4
+    score_fields:
+      prefix: "score_A"
+
+  beta: 0.1
+
+rl_training:
+  max_grad_norm: 1.0

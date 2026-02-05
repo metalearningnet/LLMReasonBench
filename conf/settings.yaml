@@ -1,14 +1,13 @@
 common:
-  model_path: "Qwen/Qwen3-30B-A3B-Instruct-2507" # Base model to use
+  model: "Qwen/Qwen3-1.7B"
+  parameter_efficient_mode: "lora+prompt-tuning"
+
   dataset: "truthfulqa"                     # Default dataset
   hf_hub_token: ""                          # Hugging Face token
-  batch_size: 1                             # Batch size for training or evaluation
-  max_length: 2048                          # Maximum sequence length
+  batch_size: 4                             # Batch size for training or evaluation
   load_in_8bit: false                       # Load model in 8-bit quantization
   load_in_4bit: false                       # Load model in 4-bit quantization
   seed: 42                                  # Random seed for reproducibility
-
-  parameter_efficient_mode: "lora+prompt-tuning" # Efficient tuning method
 
   lora_config:
     r: 16                                   # Higher rank for complex reasoning
@@ -35,6 +34,8 @@ common:
 train:
   learning_rate: 0.00001                    # Learning rate
   num_train_epochs: 1                       # Number of training epochs
+  max_prompt_length: 512                    # Maximum token length for the input prompt
+  max_completion_length: 1024               # Maximum token length for the model's completion
   warmup_steps: 100                         # Warmup steps for scheduler
   gradient_accumulation_steps: 4            # Gradient accumulation steps
   logging_steps: 10                         # Log every N steps
@@ -46,7 +47,6 @@ train:
 generator:
   backend: "vllm"                           # 'openai' | 'vllm'
   mode: "train"                             # Default mode for generation
-  max_tokens: 2048                          # Maximum number of tokens to generate in the completion
   temperature: 0.3                          # Temperature for generation
   top_p: 1.0                                # Nucleus sampling parameter
   frequency_penalty: 0.0                    # Frequency penalty
@@ -60,25 +60,25 @@ generator:
   require_memory_before_reason: false       # Whether to require at least one <memory> (factual knowledge) step before any <reason> (reasoning) steps
   require_both_memory_reason: false         # Whether to require both <memory> and <reason> step types in each CoT
   validate_cot_steps: true                  # Whether to validate the quality and structure of generated Chain-of-Thought steps
-  batch_size: 64                            # Batch size for generation
   max_retries: 1                            # Maximum number of retry attempts
 
   llm_api:                                  # OpenAI API configuration (used when backend='openai')
     api_key: ""                             # API key for the LLM service
     api_base: "https://api.openai.com/v1"   # API endpoint URL
-    model: "gpt-4o"                         # Model name to use
     timeout: 60                             # Request timeout in seconds
     retry_min_wait: 1                       # Minimum wait between retries (seconds)
     retry_max_wait: 60                      # Maximum wait between retries (seconds)
 
+    model: "gpt-4o"
+
   vllm:                                     # vLLM configuration (used when backend='vllm')
-    model: "Qwen/Qwen3-30B-A3B-Instruct-2507" # Path to local model or HuggingFace model name
-    max_model_len: 2560                     # Maximum model context length
     seed: 42                                # Random seed for reproducibility
     tensor_parallel_size: 1                 # Tensor parallelism (number of GPUs)
     gpu_memory_utilization: 0.8             # GPU memory utilization (0.0-1.0)
     use_chat_template: true                 # Whether to use chat template for formatting
-    system_message: "You are a helpful assistant." # System message for chat template
+
+    model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    system_message: "You are a helpful assistant."
 
 logging:
   wandb_project: "mem"                      # Weights & Biases project name

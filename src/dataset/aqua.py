@@ -6,6 +6,3 @@ class AquaGenerator(DatasetGenerator):
 
 class Aqua(JsonBasedData):
     INSTRUCTION = "Answer the following math question. Choose the most appropriate answer from options A through E."
-    
-    def get_instruction(self) -> str:
-        return self.INSTRUCTION

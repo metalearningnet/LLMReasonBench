@@ -1,4 +1,5 @@
 import re
+import sys
 import json
 import torch
 import random
@@ -12,7 +13,8 @@ from huggingface_hub import login
 from preprocess import DataConfig
 from train import create_cot_tokens
 from model_loader import AutoCausalLM
-from torch.utils.data import DataLoader, Subset
+from peft import PeftModel, PeftConfig
+from torch.utils.data import DataLoader
 from dataclasses import dataclass, field, asdict
 from peft_model import PeftModelForCausalLMWrapper
 from typing import Optional, Dict, List, Tuple, Any
@@ -23,17 +25,16 @@ from config import (
 
 @dataclass
 class ModelArguments:
-    model_path: Optional[str] = field(
+    model: Optional[str] = field(
         default=None,
-        metadata={
-            "help": "Path to trained model checkpoint. Required for evaluation."
-        }
+        metadata={"help": "Path to trained model checkpoint. Required for evaluation."}
     )
     cache_dir: Optional[str] = field(default=None)
     output_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the output directory."}
     )
+    use_cot: Optional[bool] = field(default=True)
     max_length: Optional[int] = field(default=1000)
     save_result: Optional[bool] = field(default=True)
     load_in_8bit: Optional[bool] = field(default=False)
@@ -103,106 +104,370 @@ class TokenizerFactory:
 
 class ModelPathResolver:
     @staticmethod
-    def resolve(model_args: ModelArguments) -> Tuple[str, Optional[Path], Optional[Path], Path]:
-        model_name = model_args.model_path
+    def resolve(model_args: ModelArguments) -> Tuple[str, Optional[Path], Optional[Path], Optional[Path]]:
+        model_path = Path(model_args.model)
+        
+        if model_path.exists() and model_path.is_dir():
+            logger.info(f"Model path is a directory: {model_path}")
+            
+            base_model_name = None
+            checkpoint_dir = model_path
+            
+            base_info_path = model_path / "base_model_info.json"
+            if base_info_path.exists():
+                try:
+                    with open(base_info_path, "r") as f:
+                        base_info = json.load(f)
+                    base_model_name = base_info.get("base_model_name_or_path")
+                    if base_model_name:
+                        logger.info(f"Found base model in checkpoint: {base_model_name}")
+                        return base_model_name, None, None, checkpoint_dir
+                except Exception as e:
+                    logger.warning(f"Failed to read base_model_info.json: {e}")
+            
+            adapter_config_path = model_path / "adapter_config.json"
+            if adapter_config_path.exists():
+                try:
+                    config = PeftConfig.from_pretrained(str(model_path))
+                    base_model_name = config.base_model_name_or_path
+                    logger.info(f"Base model from adapter config: {base_model_name}")
+                    return base_model_name, None, None, checkpoint_dir
+                except Exception as e:
+                    logger.warning(f"Could not get base model from adapter config: {e}")
+            
+            training_args_path = model_path / "training_args.json"
+            if training_args_path.exists():
+                try:
+                    with open(training_args_path, "r") as f:
+                        training_args = json.load(f)
+                    
+                    if 'model_name_or_path' in training_args:
+                        base_model_name = training_args['model_name_or_path']
+                    elif 'model' in training_args:
+                        base_model_name = training_args['model']
+                    
+                    if base_model_name:
+                        logger.info(f"Base model from training args: {base_model_name}")
+                        return base_model_name, None, None, checkpoint_dir
+                except Exception as e:
+                    logger.warning(f"Failed to read training_args.json: {e}")
+            
+            logger.info(f"Using directory as model: {model_path}")
+            return str(model_path), None, None, None
+        
+        logger.info(f"Model path appears to be a model identifier: {model_path}")
+        
         checkpoint_dir = Path(DEFAULT_CHECKPOINT_DIR)
-        input_embedding_file, output_embedding_file = ModelPathResolver._get_embedding_files(
-            model_args, checkpoint_dir
-        )
-        return model_name, input_embedding_file, output_embedding_file, checkpoint_dir
-    
-    @staticmethod
-    def _get_embedding_files(
-        model_args: ModelArguments,
-        checkpoint_dir: Path
-    ) -> Tuple[Optional[Path], Optional[Path]]:
-        if 'prompt-tuning' not in model_args.parameter_efficient_mode:
-            return None, None
+        if checkpoint_dir.exists():
+            input_embedding_file = checkpoint_dir / "input_embeddings.pt"
+            output_embedding_file = checkpoint_dir / "output_embeddings.pt"
+            
+            if input_embedding_file.exists() and output_embedding_file.exists():
+                logger.info(f"Found custom embedding files in {checkpoint_dir}")
+                return str(model_path), input_embedding_file, output_embedding_file, checkpoint_dir
         
-        possible_paths = [
-            (checkpoint_dir / 'embeddings.pt', None),
-            (checkpoint_dir / 'input_embeddings.pt', checkpoint_dir / 'output_embeddings.pt'),
-        ]
-        
-        for input_path, output_path in possible_paths:
-            if input_path.exists():
-                if output_path is None or output_path.exists():
-                    logger.debug(f"Found embedding files: {input_path}, {output_path}")
-                    return input_path, output_path
-        
-        logger.debug("No embedding files found")
-        return None, None
+        return str(model_path), None, None, None
 
 class ModelLoader:
     @staticmethod
     def load(
         model_args: ModelArguments,
         model_name: str,
-        input_embedding_file: Optional[Path]=None,
-        output_embedding_file: Optional[Path]=None,
-        num_new_tokens: Optional[int]=None
+        input_embedding_file: Optional[Path] = None,
+        output_embedding_file: Optional[Path] = None,
+        num_new_tokens: Optional[int] = None,
+        checkpoint_dir: Optional[Path] = None
     ) -> torch.nn.Module:
-        logger.debug(f"Loading model {model_name}")
+        logger.info(f"Loading model from: {model_name}")
         
-        if model_name == MD_PATH:
-            if not MD_SRC.exists():
-                logger.error(f"Failed to find {MD_SRC}")
-            import sys
-            sys.path.append(str(MD_SRC))
-            from md import MD
-            from utils import md_cfg
-            model = MD.from_pretrained(ckpt_path=md_cfg.ckpt_path)
+        if model_name in RESERVED_MODELS:
+            logger.info(f"Loading reserved model: {model_name}")
+            if model_name == MD_PATH:
+                if not MD_SRC.exists():
+                    logger.error(f"Failed to find {MD_SRC}")
+                sys.path.append(str(MD_SRC))
+                from md import MD
+                from utils import md_cfg
+                model = MD.from_pretrained(ckpt_path=md_cfg.ckpt_path)
+                return model
+            else:
+                raise ValueError(f"Unknown reserved model: {model_name}")
+        
+        model_type = ModelLoader._detect_model_type(
+            model_args, model_name, checkpoint_dir,
+            input_embedding_file, output_embedding_file
+        )
+        
+        logger.info(f"Detected model type: {model_type}")
+        
+        if model_type == "rl_peft":
+            return ModelLoader._load_rl_peft_model(
+                model_args=model_args,
+                base_model_name=model_name,
+                checkpoint_dir=checkpoint_dir,
+                merge_lora=getattr(model_args, 'merge_lora', False)
+            )
+        elif model_type == "custom_peft":
+            return ModelLoader._load_custom_peft_model(
+                model_args=model_args,
+                base_model_name=model_name,
+                checkpoint_dir=checkpoint_dir,
+                input_embedding_file=input_embedding_file,
+                output_embedding_file=output_embedding_file,
+                num_new_tokens=num_new_tokens
+            )
+        elif model_type == "base_model_with_lora":
+            return ModelLoader._load_base_model_with_lora(
+                model_args=model_args,
+                model_name=model_name,
+                checkpoint_dir=checkpoint_dir,
+                num_new_tokens=num_new_tokens
+            )
+        elif model_type == "standalone_model":
+            return ModelLoader._load_standalone_model(
+                model_args=model_args,
+                model_name=model_name
+            )
         else:
-            load_kwargs = ModelLoader._prepare_load_kwargs(
-                model_args,
-                model_name,
-                input_embedding_file,
-                output_embedding_file,
-                num_new_tokens
+            logger.error(f"Unknown model type: {model_type}")
+            raise ValueError(f"Unknown model type: {model_type}")
+    
+    @staticmethod
+    def _detect_model_type(
+        model_args: ModelArguments,
+        model_name: str,
+        checkpoint_dir: Optional[Path],
+        input_embedding_file: Optional[Path],
+        output_embedding_file: Optional[Path]
+    ) -> str:
+        if checkpoint_dir and checkpoint_dir.exists():
+            has_training_args = (checkpoint_dir / "training_args.json").exists()
+            has_adapter_config = (checkpoint_dir / "adapter_config.json").exists()
+            has_adapter_model = (
+                (checkpoint_dir / "adapter_model.safetensors").exists() or
+                (checkpoint_dir / "adapter_model.bin").exists()
             )
             
-            model = ModelLoader._load_base_model(load_kwargs)
-        
-            if 'lora' in model_args.parameter_efficient_mode:
-                model = ModelLoader._apply_lora(model_args, model, num_new_tokens)
+            has_custom_embeddings = (
+                (checkpoint_dir / "input_embeddings.pt").exists() and
+                (checkpoint_dir / "output_embeddings.pt").exists()
+            )
             
-            model = ModelLoader._place_model_on_device(model, model_args)
-
-        return model
-
+            if has_training_args and has_adapter_config and has_adapter_model:
+                return "rl_peft"
+            elif has_adapter_config and has_custom_embeddings:
+                return "custom_peft"
+            elif has_adapter_config and has_adapter_model:
+                logger.info("Detected standard PEFT model (not RL-trained)")
+                return "base_model_with_lora"
+        
+        if input_embedding_file and output_embedding_file:
+            if input_embedding_file.exists() and output_embedding_file.exists():
+                return "custom_peft"
+        
+        if model_args.parameter_efficient_mode and 'lora' in model_args.parameter_efficient_mode:
+            return "base_model_with_lora"
+        
+        return "standalone_model"
+    
     @staticmethod
-    def _place_model_on_device(model: torch.nn.Module, model_args: ModelArguments) -> torch.nn.Module:
-        try:
-            if hasattr(model, 'device'):
-                logger.info(f"Model device attribute: {model.device}")
-            
-            if model_args.load_in_8bit or model_args.load_in_4bit:
-                logger.info("Using quantized model")
-                return model
-            
-            if torch.cuda.is_available():
-                model = model.to('cuda')
-                
-                all_on_gpu = True
-                for name, param in model.named_parameters():
-                    if param.device.type != 'cuda':
-                        logger.error(f"Parameter {name} is NOT on GPU: {param.device}")
-                        all_on_gpu = False
-                
-                if all_on_gpu:
-                    logger.info("All model parameters are on GPU")
-                else:
-                    logger.error("Some parameters are NOT on GPU!")
-                
-                for name, buffer in model.named_buffers():
-                    if buffer.device.type != 'cuda':
-                        logger.warning(f"Buffer {name} is NOT on GPU: {buffer.device}")
-            else:
-                logger.info("Model on CPU")
-        except Exception as e:
-            logger.warning(f"Could not check model device: {e}")
+    def _load_rl_peft_model(
+        model_args: ModelArguments,
+        base_model_name: str,
+        checkpoint_dir: Path,
+        merge_lora: bool = False
+    ) -> torch.nn.Module:
+        logger.info("Loading RL-trained PEFT model")
+        logger.info(f"Base model: {base_model_name}")
+        logger.info(f"Checkpoint: {checkpoint_dir}")
+        logger.info(f"Merge LoRA: {merge_lora}")
         
-        return model
+        try:
+            base_model = ModelLoader._load_base_model_with_kwargs(
+                model_name=base_model_name,
+                model_args=model_args
+            )
+            
+            model = PeftModel.from_pretrained(base_model, str(checkpoint_dir))
+            logger.info("Loaded PEFT adapters")
+            
+            if merge_lora:
+                logger.info("Merging LoRA adapters into base model...")
+                model = model.merge_and_unload()
+                logger.info("LoRA adapters merged successfully")
+            
+            return model
+        except Exception as e:
+            logger.error(f"Failed to load RL-trained PEFT model: {e}")
+            raise
+    
+    @staticmethod
+    def _load_custom_peft_model(
+        model_args: ModelArguments,
+        base_model_name: str,
+        checkpoint_dir: Optional[Path] = None,
+        input_embedding_file: Optional[Path] = None,
+        output_embedding_file: Optional[Path] = None,
+        num_new_tokens: Optional[int] = None
+    ) -> torch.nn.Module:
+        logger.info("Loading custom PEFT model")
+        
+        try:
+            load_kwargs = {
+                "pretrained_model_name_or_path": base_model_name,
+                "parameter_efficient_mode": model_args.parameter_efficient_mode,
+                "cache_dir": model_args.cache_dir,
+                "n_tokens": num_new_tokens or 0,
+                "input_embedding_file": str(input_embedding_file) if input_embedding_file else None,
+                "output_embedding_file": str(output_embedding_file) if output_embedding_file else None
+            }
+            
+            device_map = "auto" if torch.cuda.is_available() else None
+            load_kwargs["device_map"] = device_map
+            
+            if model_args.load_in_8bit:
+                load_kwargs["load_in_8bit"] = True
+                load_kwargs["torch_dtype"] = torch.float16
+                logger.info("Loading base model in 8-bit precision")
+            elif model_args.load_in_4bit:
+                load_kwargs["load_in_4bit"] = True
+                load_kwargs["torch_dtype"] = torch.float16
+                logger.info("Loading base model in 4-bit precision")
+            else:
+                load_kwargs["torch_dtype"] = torch.float32
+                logger.info("Loading base model with float32 precision")
+            
+            model = AutoCausalLM.from_pretrained(**load_kwargs)
+            logger.info("Base model loaded successfully")
+            
+            if checkpoint_dir and checkpoint_dir.exists():
+                try:
+                    model = PeftModelForCausalLMWrapper.from_pretrained(
+                        model,
+                        checkpoint_dir,
+                        load_embeddings=False,
+                        n_tokens=num_new_tokens or 0
+                    )
+                    logger.info("Loaded custom PEFT adapters")
+                except Exception as e:
+                    logger.warning(f"Failed to load custom PEFT adapters: {e}")
+                    logger.info("Trying to load as standard PEFT model...")
+                    
+                    try:
+                        model = PeftModel.from_pretrained(model, str(checkpoint_dir))
+                        logger.info("Loaded as standard PEFT model (fallback)")
+                    except Exception as e2:
+                        logger.warning(f"Failed to load as standard PEFT: {e2}")
+                        logger.info("Returning model without adapters")
+            
+            return model
+        except Exception as e:
+            logger.error(f"Failed to load custom PEFT model: {e}")
+            raise
+    
+    @staticmethod
+    def _load_base_model_with_lora(
+        model_args: ModelArguments,
+        model_name: str,
+        checkpoint_dir: Path,
+        num_new_tokens: Optional[int] = None
+    ) -> torch.nn.Module:
+        logger.info("Loading base model with LoRA adapters")
+        
+        try:
+            base_model = ModelLoader._load_base_model_with_kwargs(
+                model_name=model_name,
+                model_args=model_args
+            )
+            
+            model = PeftModel.from_pretrained(base_model, str(checkpoint_dir))
+            logger.info("Loaded LoRA adapters as standard PEFT")
+            
+            if getattr(model_args, 'merge_lora', False):
+                logger.info("Merging LoRA adapters...")
+                model = model.merge_and_unload()
+            
+            return model
+        except Exception as e:
+            logger.error(f"Failed to load base model with LoRA: {e}")
+            
+            try:
+                logger.info("Trying custom PEFT wrapper as fallback...")
+                
+                base_model = ModelLoader._load_base_model_with_kwargs(
+                    model_name=model_name,
+                    model_args=model_args
+                )
+                
+                model = PeftModelForCausalLMWrapper.from_pretrained(
+                    base_model,
+                    checkpoint_dir,
+                    load_embeddings=True,
+                    n_tokens=num_new_tokens or 0
+                )
+                logger.info("Loaded with custom PEFT wrapper (fallback)")
+                
+                return model
+            except Exception as e2:
+                logger.error(f"Failed to load with custom wrapper: {e2}")
+                raise
+    
+    @staticmethod
+    def _load_standalone_model(
+        model_args: ModelArguments,
+        model_name: str
+    ) -> torch.nn.Module:
+        logger.info(f"Loading standalone model: {model_name}")
+        
+        return ModelLoader._load_base_model_with_kwargs(
+            model_name=model_name,
+            model_args=model_args
+        )
+    
+    @staticmethod
+    def _load_base_model_with_kwargs(
+        model_name: str,
+        model_args: ModelArguments
+    ) -> torch.nn.Module:
+        load_kwargs = {
+            "pretrained_model_name_or_path": model_name,
+            "device_map": "auto" if torch.cuda.is_available() else None,
+            "trust_remote_code": True
+        }
+        
+        if model_args.load_in_8bit:
+            load_kwargs["load_in_8bit"] = True
+            load_kwargs["torch_dtype"] = torch.float16
+            logger.info("Loading model in 8-bit precision")
+        elif model_args.load_in_4bit:
+            load_kwargs["load_in_4bit"] = True
+            load_kwargs["torch_dtype"] = torch.float16
+            logger.info("Loading model in 4-bit precision")
+        else:
+            load_kwargs["torch_dtype"] = torch.float32
+            logger.info("Loading model with float32 precision")
+        
+        if model_args.cache_dir:
+            load_kwargs["cache_dir"] = model_args.cache_dir
+        
+        if getattr(model_args, 'enable_cpu_offload', False):
+            load_kwargs["offload_folder"] = "offload"
+            load_kwargs["offload_state_dict"] = True
+            logger.info("CPU offloading enabled")
+        
+        try:
+            try:
+                model = AutoCausalLM.from_pretrained(**load_kwargs)
+            except:
+                logger.info("AutoCausalLM not available, using AutoModelForCausalLM")
+                model = transformers.AutoModelForCausalLM.from_pretrained(**load_kwargs)
+            
+            logger.info(f"Base model loaded successfully: {model_name}")
+            return model
+            
+        except Exception as e:
+            logger.error(f"Failed to load base model {model_name}: {e}")
+            raise
     
     @staticmethod
     def _prepare_load_kwargs(
@@ -212,6 +477,8 @@ class ModelLoader:
         output_embedding_file: Optional[Path],
         num_new_tokens: int
     ) -> Dict[str, Any]:
+        logger.warning("Using legacy _prepare_load_kwargs method")
+        
         load_kwargs = {
             "n_tokens": num_new_tokens,
             "input_embedding_file": str(input_embedding_file) if input_embedding_file else None,
@@ -250,6 +517,8 @@ class ModelLoader:
     
     @staticmethod
     def _load_base_model(load_kwargs: Dict[str, Any]) -> torch.nn.Module:
+        logger.warning("Using legacy _load_base_model method")
+        
         try:
             model = AutoCausalLM.from_pretrained(**load_kwargs)
             logger.info(f"Base model loaded successfully")
@@ -259,24 +528,37 @@ class ModelLoader:
             raise
     
     @staticmethod
-    def _apply_lora(
-        model_args: ModelArguments,
-        model: torch.nn.Module,
-        num_new_tokens: int
-    ) -> torch.nn.Module:
+    def _place_model_on_device(model: torch.nn.Module, model_args: ModelArguments) -> torch.nn.Module:
         try:
-            _, _, _, checkpoint_dir = ModelPathResolver.resolve(model_args)
-            model = PeftModelForCausalLMWrapper.from_pretrained(
-                model,
-                checkpoint_dir,
-                load_embeddings=True,
-                n_tokens=num_new_tokens
-            )
-            logger.info(f"LoRA adapter loaded successfully from: {checkpoint_dir}")
-            return model
+            if hasattr(model, 'device'):
+                logger.info(f"Model device attribute: {model.device}")
+            
+            if model_args.load_in_8bit or model_args.load_in_4bit:
+                logger.info("Using quantized model with auto device mapping")
+                return model
+            
+            if torch.cuda.is_available():
+                first_param = next(model.parameters())
+                if first_param.device.type != 'cuda':
+                    logger.info("Moving model to GPU...")
+                    model = model.to('cuda')
+                
+                all_on_gpu = True
+                for name, param in model.named_parameters():
+                    if param.device.type != 'cuda':
+                        logger.warning(f"Parameter {name} is NOT on GPU: {param.device}")
+                        all_on_gpu = False
+                
+                if all_on_gpu:
+                    logger.info("All model parameters are on GPU")
+                else:
+                    logger.warning("Some parameters are NOT on GPU!")
+            else:
+                logger.info("Model on CPU")
         except Exception as e:
-            logger.error(f"Failed to apply LoRA: {e}")
-            raise
+            logger.warning(f"Could not check model device: {e}")
+        
+        return model
 
 class DatasetManager:
     @classmethod
@@ -315,19 +597,21 @@ class DatasetManager:
         random.seed(seed)
         indices = random.sample(range(len(dataset)), num_samples)
         
-        try:
-            return Subset(dataset, indices)
-        except:
-            logger.warning("Could not create Subset, attempting custom sampling")
-            if hasattr(dataset, 'x') and hasattr(dataset, 'y'):
-                sampled_x = [dataset.x[i] for i in indices]
-                sampled_y = [dataset.y[i] for i in indices]
-                dataset.x = sampled_x
-                dataset.y = sampled_y
-                logger.info(f"Sampled dataset to {len(sampled_x)} examples")
-                return dataset
+        class SampledDataset(torch.utils.data.Dataset):
+            def __init__(self, original_dataset, indices):
+                self.original_dataset = original_dataset
+                self.indices = indices
+                
+            def __len__(self):
+                return len(self.indices)
+                
+            def __getitem__(self, idx):
+                return self.original_dataset[self.indices[idx]]
+                
+            def __getattr__(self, name):
+                return getattr(self.original_dataset, name)
         
-        raise ValueError("Dataset cannot be sampled")
+        return SampledDataset(dataset, indices)
 
 class BatchEvaluator:
     @staticmethod
@@ -442,7 +726,7 @@ class BatchEvaluator:
             (r'Then,\s*', ''),
             (r'Finally,\s*', ''),
             (r'In summary,\s*', ''),
-            (r'To summarize,\s*', ''),
+            (r'To summarize,\s*', '')
         ]
         
         for pattern, replacement in conversational_patterns:
@@ -454,7 +738,7 @@ class BatchEvaluator:
                 patterns_to_fix = [
                     (rf'<{re.escape(token)}>\s*:\s*', f'<{token}>: '),
                     (rf'<{re.escape(token)}>:\s+', f'<{token}>: '),
-                    (rf'<{re.escape(token)}>:(?!\s)', f'<{token}>: '),
+                    (rf'<{re.escape(token)}>:(?!\s)', f'<{token}>: ')
                 ]
                 
                 for pattern, replacement in patterns_to_fix:
@@ -528,7 +812,7 @@ class BatchEvaluator:
             r'\$\$([^$]+)\$\$',
             r'\$([^$]+)\$',
             r'\\\[([^\]]+)\\\]',
-            r'\\begin\{equation\}(.+?)\\end\{equation\}',
+            r'\\begin\{equation\}(.+?)\\end\{equation\}'
         ]
         
         for pattern in math_patterns:
@@ -540,7 +824,7 @@ class BatchEvaluator:
         
         math_answer_patterns = [
             r'=\s*([\d\.\+\-\*/\(\)\s]+)(?=[\s\.\n]|$)',
-            r'is\s*([\d\.\+\-\*/\(\)\s]+)(?=[\s\.\n]|$)',
+            r'is\s*([\d\.\+\-\*/\(\)\s]+)(?=[\s\.\n]|$)'
         ]
         
         for pattern in math_answer_patterns:
@@ -561,7 +845,7 @@ class BatchEvaluator:
             r'[\(\[]?\s*([A-G])\s*[\)\]]',
             r'Answer:\s*([A-G])',
             r'Option\s*([A-G])',
-            r'Choice\s*([A-G])',
+            r'Choice\s*([A-G])'
         ]
         
         for pattern in choice_patterns:
@@ -611,7 +895,7 @@ class BatchEvaluator:
             BatchEvaluator._extract_via_structured_patterns,
             BatchEvaluator._extract_via_keywords,
             BatchEvaluator._extract_via_numeric_patterns,
-            BatchEvaluator._extract_via_final_line,
+            BatchEvaluator._extract_via_final_line
         ]
         
         for strategy in extraction_strategies:
@@ -635,7 +919,7 @@ class BatchEvaluator:
             (r'Therefore,\s*([^\n\.]+)', 1),
             (r'Thus,\s*([^\n\.]+)', 1),
             (r'Hence,\s*([^\n\.]+)', 1),
-            (r'So,\s*([^\n\.]+)', 1),
+            (r'So,\s*([^\n\.]+)', 1)
         ]
         
         for pattern, group in patterns:
@@ -680,7 +964,7 @@ class BatchEvaluator:
             r'is\s*([\d\.]+)',
             r'are\s*([\d\.]+)',
             r'equals\s*([\d\.]+)',
-            r'gives\s*([\d\.]+)',
+            r'gives\s*([\d\.]+)'
         ]
         
         for pattern in numeric_patterns:
@@ -893,16 +1177,45 @@ class ResultSaver:
         model_args: ModelArguments,
         data_args: DataArguments
     ) -> Path:
-        results_dir = Path(model_args.output_dir) / data_args.dataset
+        results_dir = Path(model_args.output_dir)
         results_dir.mkdir(parents=True, exist_ok=True)
-        return results_dir
+        
+        dataset_dir = results_dir / data_args.dataset
+        dataset_dir.mkdir(exist_ok=True)
+        
+        if model_args.model:
+            model_name = Path(model_args.model).name
+            model_dir = dataset_dir / model_name
+            model_dir.mkdir(exist_ok=True)
+            return model_dir
+        
+        return dataset_dir
     
     @staticmethod
     def _get_model_identifier(model_args: ModelArguments) -> str:
-        if Path(model_args.model_path).exists():
-            return Path(model_args.model_path).name
+        if not model_args.model:
+            return "unknown_model"
+        
+        model_path = Path(model_args.model)
+        
+        if model_path.exists() and model_path.is_dir():
+            if (model_path / "training_args.json").exists():
+                try:
+                    with open(model_path / "training_args.json", "r") as f:
+                        training_args = json.load(f)
+                    
+                    if "run_name" in training_args:
+                        return training_args["run_name"]
+                    
+                    if "dataset_name" in training_args:
+                        dataset_name = training_args["dataset_name"]
+                        return f"{model_path.name}_{dataset_name}"
+                except Exception as e:
+                    logger.debug(f"Could not extract identifier from training args: {e}")
+            
+            return model_path.name
         else:
-            return model_args.model_path.replace('/', '_')
+            return str(model_args.model).replace('/', '_')
     
     @staticmethod
     def _save_json_results(
@@ -917,39 +1230,64 @@ class ResultSaver:
         accuracy: float,
         config: Dict[str, Any]
     ) -> Path:
-        json_path = results_dir / f"{model_identifier}_{timestamp}_results.json"
+        filename = f"{model_identifier}_{timestamp}_results.json"
+        json_path = results_dir / filename
+        model_info = config.pop('model_info', {}) if isinstance(config, dict) else {}
         
         results = {
-            "model": model_args.model_path,
+            "model": model_args.model,
             "dataset": data_args.dataset,
             "accuracy": accuracy,
             "total_examples": total_examples,
             "correct_predictions": total_correct,
             "timestamp": timestamp,
-            "config": {
-                "model_args": asdict(model_args),
-                "data_args": asdict(data_args),
-                **config
+            "model_info": {
+                **model_info,
+                "model_args": ResultSaver._clean_dataclass_for_json(asdict(model_args)),
+                "data_args": ResultSaver._clean_dataclass_for_json(asdict(data_args)),
             },
+            "config": config,
             "predictions": all_outputs
         }
         
-        def convert_path_to_str(obj):
-            if isinstance(obj, dict):
-                return {k: convert_path_to_str(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_path_to_str(item) for item in obj]
-            elif isinstance(obj, Path):
-                return str(obj)
-            else:
-                return obj
+        results = ResultSaver._convert_paths_to_strings(results)
         
-        results = convert_path_to_str(results)
         with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=4)
+            json.dump(results, f, ensure_ascii=False, indent=4, default=str)
         
         logger.debug(f"Saved detailed results to: {json_path}")
         return json_path
+    
+    @staticmethod
+    def _clean_dataclass_for_json(obj: Any) -> Any:
+        if hasattr(obj, '__dict__'):
+            obj = vars(obj)
+        elif hasattr(obj, '_asdict'):
+            obj = obj._asdict()
+        
+        if isinstance(obj, dict):
+            result = {}
+            for key, value in obj.items():
+                if not key.startswith('_'):
+                    result[key] = ResultSaver._clean_dataclass_for_json(value)
+            return result
+        elif isinstance(obj, list):
+            return [ResultSaver._clean_dataclass_for_json(item) for item in obj]
+        elif isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
+        else:
+            return str(obj)
+    
+    @staticmethod
+    def _convert_paths_to_strings(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: ResultSaver._convert_paths_to_strings(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [ResultSaver._convert_paths_to_strings(item) for item in obj]
+        elif isinstance(obj, Path):
+            return str(obj)
+        else:
+            return obj
     
     @staticmethod
     def _save_csv_summary(
@@ -959,21 +1297,29 @@ class ResultSaver:
         all_outputs: List[Dict]
     ) -> Optional[Path]:
         try:
+            if not all_outputs:
+                logger.warning("No outputs to save to CSV")
+                return None
+            
             csv_path = results_dir / f"{model_identifier}_{timestamp}_summary.csv"
             
-            summary_df = pd.DataFrame([
-                {
-                    'input': item['input'],
-                    'target': item['target'],
-                    'generated_text': item['generated_text'],
-                    'result': item['result']
-                }
-                for item in all_outputs
-            ])
+            csv_data = []
+            for i, item in enumerate(all_outputs):
+                csv_data.append({
+                    'index': i,
+                    'input': str(item.get('input', ''))[:500],
+                    'target': str(item.get('target', '')),
+                    'generated_text': str(item.get('generated_text', '')),
+                    'result': item.get('result', 'unknown'),
+                    'is_correct': 1 if item.get('result') == 'correct' else 0
+                })
             
+            summary_df = pd.DataFrame(csv_data)
             summary_df.to_csv(csv_path, index=False)
+            
             logger.debug(f"Saved summary to: {csv_path}")
             return csv_path
+            
         except Exception as e:
             logger.warning(f"Could not save CSV summary: {e}")
             return None
@@ -989,29 +1335,71 @@ class ResultSaver:
         csv_path: Optional[Path]
     ):
         logger.info("=" * 60)
-        logger.info("EVALUATION SUMMARY")
+        logger.info("EVALUATION RESULTS SUMMARY")
         logger.info("=" * 60)
-        logger.info(f"Model path: {model_args.model_path}")
+        logger.info(f"Model: {model_args.model}")
         logger.info(f"Dataset: {data_args.dataset}")
         logger.info(f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
         logger.info(f"Total examples: {total_examples}")
         logger.info(f"Correct predictions: {total_correct}")
         logger.info(f"Incorrect predictions: {total_examples - total_correct}")
         logger.info(f"Results saved to: {json_path}")
+        
         if csv_path:
             logger.info(f"Summary saved to: {csv_path}")
+        
+        if hasattr(model_args, 'parameter_efficient_mode'):
+            logger.info(f"Parameter efficient mode: {model_args.parameter_efficient_mode}")
+        
+        if hasattr(model_args, 'use_cot'):
+            logger.info(f"CoT enabled: {model_args.use_cot}")
+        
         logger.info("=" * 60)
+    
+    @staticmethod
+    def save_rl_specific_info(
+        checkpoint_dir: Path,
+        output_dir: Path,
+        results: Dict[str, Any]
+    ) -> Path:
+        rl_info_path = output_dir / "rl_training_info.json"
+        
+        try:
+            training_args_path = checkpoint_dir / "training_args.json"
+            if training_args_path.exists():
+                with open(training_args_path, "r") as f:
+                    training_args = json.load(f)
+                
+                rl_info = {
+                    "checkpoint_dir": str(checkpoint_dir),
+                    "training_args": training_args,
+                    "evaluation_results": {
+                        "timestamp": datetime.now().isoformat(),
+                        **results
+                    }
+                }
+                
+                with open(rl_info_path, "w") as f:
+                    json.dump(rl_info, f, indent=4, default=str)
+                
+                logger.info(f"Saved RL-specific info to: {rl_info_path}")
+            
+            return rl_info_path
+            
+        except Exception as e:
+            logger.warning(f"Could not save RL-specific info: {e}")
+            return None
 
 def evaluate() -> float:
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments))
     model_args, data_args = parser.parse_args_into_dataclasses()
     
-    if model_args.model_path is None:
-        logger.error("Error: --model-path is required for evaluation")
-        raise ValueError("model_path is required")
+    if model_args.model is None:
+        logger.error("--model is required for evaluation")
+        raise ValueError("model is required")
     
     if data_args.dataset is None:
-        logger.error("Error: --dataset is required for evaluation")
+        logger.error("--dataset is required for evaluation")
         raise ValueError("dataset is required")
     
     try:
@@ -1031,6 +1419,7 @@ def evaluate() -> float:
     
     if model_args.output_dir is None:
         model_args.output_dir = DEFAULT_EVAL_OUTPUT_DIR
+        logger.info(f"Using default output directory: {model_args.output_dir}")
     
     if model_args.hf_hub_token:
         try:
@@ -1041,48 +1430,134 @@ def evaluate() -> float:
     
     model_name, input_embedding_file, output_embedding_file, checkpoint_dir = ModelPathResolver.resolve(model_args)
     
-    if model_name not in RESERVED_MODELS:
-        tokenizer = TokenizerFactory.create(model_args.model_path, model_args.cache_dir)
-        logger.debug(f"Resolved model paths: base={model_name}, checkpoint={checkpoint_dir}")
-        
-        cot_tokens = create_cot_tokens(model_args, tokenizer)
-        num_new_tokens = len(cot_tokens)
-        if cot_tokens:
-            logger.debug(f"Loaded {len(cot_tokens)} indicator tokens")
-
-        model = ModelLoader.load(
-            model_args,
-            model_name,
-            input_embedding_file,
-            output_embedding_file,
-            num_new_tokens
-        )
-    else:
-        model = ModelLoader.load(
-            model_args,
-            model_name
-        )
+    logger.info(f"Model path: {model_args.model}")
+    logger.info(f"Resolved model name: {model_name}")
+    logger.info(f"Checkpoint directory: {checkpoint_dir}")
+    
+    is_rl_trained_model = False
+    
+    if model_name in RESERVED_MODELS:
+        logger.info(f"Loading reserved model: {model_name}")
+        model = ModelLoader.load(model_args, model_name)
         tokenizer = model.tokenizer
+    else:
+        if checkpoint_dir and checkpoint_dir.exists():
+            has_training_args = (checkpoint_dir / "training_args.json").exists()
+            has_adapter_config = (checkpoint_dir / "adapter_config.json").exists()
+            has_adapter_model = (
+                (checkpoint_dir / "adapter_model.safetensors").exists() or
+                (checkpoint_dir / "adapter_model.bin").exists()
+            )
+            
+            if has_training_args and has_adapter_config and has_adapter_model:
+                model_args.use_cot = False
+                is_rl_trained_model = True
+                logger.info("Detected RL-trained model (standard PEFT format)")
+
+        tokenizer_path = str(checkpoint_dir) if checkpoint_dir and checkpoint_dir.exists() else model_name
+        logger.info(f"Loading tokenizer from: {tokenizer_path}")
+        
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            trust_remote_code=True,
+            padding_side="left"
+        )
+        
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            logger.info(f"Set pad_token to eos_token: {tokenizer.pad_token}")
+        
+        cot_tokens = []
+        num_new_tokens = 0
+        use_cot = getattr(model_args, 'use_cot', False)
+        if use_cot and not is_rl_trained_model:
+            logger.info("Creating CoT tokens for non-RL model")
+            try:
+                cot_tokens = create_cot_tokens(model_args, tokenizer)
+                num_new_tokens = len(cot_tokens)
+                if cot_tokens:
+                    logger.info(f"Created {len(cot_tokens)} CoT indicator tokens")
+            except Exception as e:
+                logger.warning(f"Failed to create CoT tokens: {e}")
+                cot_tokens = []
+        elif use_cot and is_rl_trained_model:
+            logger.warning("CoT requested for RL-trained model - this is not recommended!")
+            try:
+                cot_tokens = create_cot_tokens(model_args, tokenizer)
+                num_new_tokens = len(cot_tokens)
+                if cot_tokens:
+                    logger.warning(f"Created {len(cot_tokens)} CoT tokens for RL-trained model (may not work)")
+            except Exception as e:
+                logger.error(f"Failed to create CoT tokens for RL model: {e}")
+        else:
+            logger.info("CoT tokens disabled")
+        
+        logger.info("Loading model...")
+        model = ModelLoader.load(
+            model_args=model_args,
+            model_name=model_name,
+            input_embedding_file=input_embedding_file,
+            output_embedding_file=output_embedding_file,
+            num_new_tokens=num_new_tokens,
+            checkpoint_dir=checkpoint_dir
+        )
+        
+        logger.info("=" * 60)
+        logger.info("MODEL INFORMATION")
+        logger.info("=" * 60)
+        logger.info(f"Model type: {type(model).__name__}")
+        logger.info(f"Is RL-trained model: {is_rl_trained_model}")
+        logger.info(f"CoT enabled: {use_cot}")
+        logger.info(f"Number of CoT tokens: {num_new_tokens}")
+        
+        try:
+            if isinstance(model, PeftModel):
+                logger.info("Model is a PEFT model with LoRA adapters")
+            else:
+                logger.info("Model is a standard (non-PEFT) model")
+        except ImportError:
+            logger.info("PEFT not available, model type unknown")
+        
+        logger.info(f"Model device: {next(model.parameters()).device}")
+        logger.info("=" * 60)
     
     model.eval()
-    data_class = DatasetManager.get_data_class(data_args.dataset)
-    logger.debug(f"Using dataset class: {data_class.__name__}")
+    logger.info("Model set to evaluation mode")
+    
+    try:
+        data_class = DatasetManager.get_data_class(data_args.dataset)
+        logger.info(f"Using dataset class: {data_class.__name__}")
+    except ValueError as e:
+        logger.error(f"Dataset error: {e}")
+        raise
     
     data_config = DataConfig()
-    datasets_config = load_datasets_config()
-    data_config.dataset = datasets_config[data_args.dataset]
-
-    dataset = DatasetManager.create_dataset(
-        data_class,
-        data_args.dataset,
-        "test",
-        data_config
-    )
+    try:
+        datasets_config = load_datasets_config()
+        data_config.dataset = datasets_config.get(data_args.dataset, {})
+    except Exception as e:
+        logger.warning(f"Failed to load dataset config: {e}")
+        data_config.dataset = {}
+    
+    logger.info(f"Loading dataset: {data_args.dataset}")
+    try:
+        dataset = DatasetManager.create_dataset(
+            data_class,
+            data_args.dataset,
+            "test",
+            data_config
+        )
+        logger.info(f"Dataset loaded with {len(dataset)} examples")
+    except Exception as e:
+        logger.error(f"Failed to load dataset: {e}")
+        raise
     
     if data_args.num_test and len(dataset) > data_args.num_test:
+        logger.info(f"Sampling {data_args.num_test} examples from dataset")
         dataset = DatasetManager.sample_dataset(
             dataset, data_args.num_test, data_args.seed
         )
+        logger.info(f"Sampled dataset has {len(dataset)} examples")
     
     dataloader = DataLoader(
         dataset,
@@ -1092,10 +1567,8 @@ def evaluate() -> float:
     )
     logger.info(f"Created dataloader with batch size {data_args.batch_size}")
     
-    total_correct = 0
-    total_examples = 0
-    all_outputs = []
     generation_kwargs = {}
+    
     if model_args.temperature is not None:
         generation_kwargs["temperature"] = model_args.temperature
     if model_args.top_p is not None:
@@ -1113,12 +1586,23 @@ def evaluate() -> float:
                 with open(model_args.generation_config, 'r') as f:
                     file_config = json.load(f)
                     generation_kwargs.update(file_config)
+                logger.info(f"Loaded generation config from file: {model_args.generation_config}")
             else:
                 file_config = json.loads(model_args.generation_config)
                 generation_kwargs.update(file_config)
+                logger.info("Loaded generation config from JSON string")
         except Exception as e:
             logger.warning(f"Failed to load generation config: {e}")
-        
+    
+    if generation_kwargs:
+        logger.info("Generation configuration:")
+        for key, value in generation_kwargs.items():
+            logger.info(f"  {key}: {value}")
+    
+    total_correct = 0
+    total_examples = 0
+    all_outputs = []
+    
     logger.info(f"Evaluating {len(dataset)} examples in batches of {data_args.batch_size}...")
     
     with tqdm(dataloader, desc="Evaluation", unit="batch") as progress_bar:
@@ -1153,14 +1637,67 @@ def evaluate() -> float:
     
     final_accuracy = total_correct / total_examples if total_examples > 0 else 0
     
+    logger.info(f"Model type: {'RL-trained PEFT' if is_rl_trained_model else 'Standard model'}")
+    logger.info(f"Total examples evaluated: {total_examples}")
+    logger.info(f"Correct predictions: {total_correct}")
+    logger.info(f"Incorrect predictions: {total_examples - total_correct}")
+    logger.info(f"Final accuracy: {final_accuracy:.4f} ({final_accuracy*100:.2f}%)")
+    
     if model_args.save_result:
-        ResultSaver.save(
-            model_args, data_args, all_outputs,
-            total_correct, total_examples,
-            config
-        )
+        try:
+            config['model_info'] = {
+                'is_rl_trained': is_rl_trained_model,
+                'use_cot': getattr(model_args, 'use_cot', False),
+                'model_type': type(model).__name__,
+                'checkpoint_dir': str(checkpoint_dir) if checkpoint_dir else None
+            }
+            
+            ResultSaver.save(
+                model_args, data_args, all_outputs,
+                total_correct, total_examples,
+                config
+            )
+        except Exception as e:
+            logger.error(f"Failed to save results: {e}")
+    else:
+        logger.info("Results saving disabled (save_result=False)")
     
     return final_accuracy
 
+def evaluate_rl_checkpoint(checkpoint_path: str, dataset_name: str, **kwargs) -> float:
+    logger.info(f"Evaluating RL checkpoint: {checkpoint_path}")
+    
+    original_argv = sys.argv
+    
+    try:
+        args = ['--model', checkpoint_path, '--dataset', dataset_name]
+        
+        if 'batch_size' in kwargs:
+            args.extend(['--batch_size', str(kwargs['batch_size'])])
+        if 'num_test' in kwargs:
+            args.extend(['--num_test', str(kwargs['num_test'])])
+        if 'temperature' in kwargs:
+            args.extend(['--temperature', str(kwargs['temperature'])])
+        if 'output_dir' in kwargs:
+            args.extend(['--output_dir', kwargs['output_dir']])
+        
+        if kwargs.get('use_cot', False):
+            args.extend(['--use_cot', 'true'])
+        else:
+            args.extend(['--use_cot', 'false'])
+        
+        sys.argv = ['evaluate.py'] + args
+        
+        return evaluate()
+    finally:
+        sys.argv = original_argv
+
 if __name__ == "__main__":
-    evaluate()
+    try:
+        accuracy = evaluate()
+        sys.exit(0 if accuracy > 0 else 1)
+    except Exception as e:
+        logger.error(f"Evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

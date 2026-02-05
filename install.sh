@@ -54,14 +54,6 @@ show_usage() {
     cat << EOF
 Usage: $0 [OPTIONS]
 
-This script supports three distinct installation options:
-
-DEFAULT BEHAVIOR (no arguments): Installs all Python packages.
-
-============================================================================
-COMMAND LINE OPTIONS
-============================================================================
-
 Package Installation (Default):
   (no arguments)               Install all Python packages
   --help, -h                   Show this help message
@@ -73,35 +65,27 @@ Model Installation:
 Dataset Installation:
   --dataset DATASET            [Required] Hugging Face dataset identifier
                                Example: 'metalearningnet/qwen3-metamathqa-cot'
-s
+
+  --config CONFIG              Configuration name for multi-configuration datasets
+
   --name NAME                  [Required] Output filename (without extension)
                                Example: 'metamathqa' -> creates 'metamathqa_train.json'
 
   --split SPLIT                Dataset split to download (default: 'train')
 
-  --max-length LENGTH          Limit number of examples (for testing/debugging)
-
-  --config CONFIG              Configuration name for multi-configuration datasets
-
-  --shuffle                    Shuffle dataset before truncating
-
-  --seed SEED                  Random seed for shuffling (default: 42)
-
-  --streaming                  Use streaming mode for large datasets
-
-  --indent INDENT              JSON indentation level (default: 4)
+  --max-length LENGTH          Limit number of examples
 
   --output-dir DIR             Directory to save downloaded dataset (default: 'data')
 
 ============================================================================
-EXAMPLES
+EXAMPLES:
 ============================================================================
 
 Package Installation:
-  ./install.sh                    # Install all Python packages
+  ./install.sh                 # Install all Python packages
 
 Model Installation:
-  ./install.sh --model md         # Install MD model from GitHub
+  ./install.sh --model md      # Install MD model from GitHub
   ./install.sh --model md --path /path/to/local/md  # Install from local directory
 
 Dataset Installation:
@@ -175,36 +159,6 @@ parse_arguments() {
                     shift 2
                 else
                     log_error "--config requires a value"
-                fi
-                ;;
-            --shuffle)
-                DATASET_SHUFFLE=true
-                shift
-                ;;
-            --seed)
-                if [[ -n ${2:-} ]]; then
-                    if [[ ! "$2" =~ ^[0-9]+$ ]]; then
-                        log_error "--seed must be a positive integer"
-                    fi
-                    DATASET_SEED="$2"
-                    shift 2
-                else
-                    log_error "--seed requires a value"
-                fi
-                ;;
-            --streaming)
-                DATASET_STREAMING=true
-                shift
-                ;;
-            --indent)
-                if [[ -n ${2:-} ]]; then
-                    if [[ ! "$2" =~ ^[0-9]+$ ]]; then
-                        log_error "--indent must be a non-negative integer"
-                    fi
-                    DATASET_INDENT="$2"
-                    shift 2
-                else
-                    log_error "--indent requires a value"
                 fi
                 ;;
             --output-dir)

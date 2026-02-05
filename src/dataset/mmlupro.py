@@ -6,6 +6,3 @@ class MMLUProGenerator(DatasetGenerator):
 
 class MMLUPro(JsonBasedData):
     INSTRUCTION = "You are given a multiple-choice question. Analyze carefully, then choose the correct answer from the provided options."
-    
-    def get_instruction(self) -> str:
-        return self.INSTRUCTION

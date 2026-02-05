@@ -798,10 +798,18 @@ class BaseData(Dataset, ABC):
             logger.info(f"  {item['y'][:200]}...")
 
 class JsonBasedData(BaseData):
+    INSTRUCTION = ""
+
     def __init__(self, name: str, split: str, config: DataConfig):
         self.json_path_pattern = str(DEFAULT_DATA_DIR / f"{name}_{split}.json")
         logger.debug(f"JSON path pattern: {self.json_path_pattern}")
         super().__init__(name, split, config)
+    
+    def get_instruction(self) -> str:
+        if not self.INSTRUCTION:
+            logger.error(f"Instruction is not specified for {self.name}")
+        
+        return self.INSTRUCTION
     
     def load_data(self, split: str) -> List[Dict[str, Any]]:
         json_path = str(self.json_path_pattern).format(split=split)
@@ -828,7 +836,6 @@ class JsonBasedData(BaseData):
                 logger.debug(f"Sample data keys: {list(data[0].keys())}")
             
             return data
-            
         except json.JSONDecodeError as e:
             error_msg = f"Failed to parse JSON: {e}"
             logger.error(error_msg)

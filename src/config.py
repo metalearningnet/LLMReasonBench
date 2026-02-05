@@ -70,6 +70,22 @@ def load_datasets_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     
     return config
 
+def load_rl_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+    from config import CONF_DIR
+    
+    if config_path is None:
+        config_path = CONF_DIR / "rl.yaml"
+    
+    config_path = Path(config_path)
+    if not config_path.exists():
+        logger.warning(f"RL config file not found at {config_path}, using defaults")
+        return {}
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    return config or {}
+
 def update_dataclass_from_config(
     dataclass_obj: T,
     config: Dict[str, Any],
@@ -81,7 +97,7 @@ def update_dataclass_from_config(
     if isinstance(modes, str):
         modes = [modes]
     
-    protected_fields = {'dataset', 'model_path', 'batch_size'}
+    protected_fields = {'dataset', 'model', 'batch_size', 'num_train', 'num_test'}
     
     for mode in modes:
         if mode in config:

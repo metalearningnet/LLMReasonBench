@@ -76,15 +76,7 @@ class GeneratorArguments:
     )
     batch_size: Optional[int] = field(
         default=None,
-        metadata={"help": "Batch size for vLLM generation (only used with backend='vllm')"}
-    )
-    gpu_memory_utilization: Optional[float] = field(
-        default=None,
-        metadata={"help": "GPU memory utilization for vLLM (0.0-1.0, only used with backend='vllm')"}
-    )
-    tensor_parallel_size: Optional[int] = field(
-        default=None,
-        metadata={"help": "Tensor parallelism size for vLLM (number of GPUs, only used with backend='vllm')"}
+        metadata={"help": "Batch size for generation"}
     )
     config: Optional[str] = field(
         default=None,
@@ -100,12 +92,14 @@ class BaseLLMClient:
         self.config = config
         generator_config = config.get('generator', {})
         llm_config = generator_config.get('llm_api', {})
+        max_prompt_length = config['train']['max_prompt_length']
+        max_completion_length = config['train']['max_completion_length']
         
+        self.max_tokens = max_prompt_length + max_completion_length
         self.frequency_penalty = generator_config.get('frequency_penalty', 0.0)
         self.presence_penalty = generator_config.get('presence_penalty', 0.0)
         self.stop_sequences = generator_config.get('stop_sequences', [])
         self.temperature = generator_config.get('temperature', 0.3)
-        self.max_tokens = generator_config.get('max_tokens', 1024)
         self.max_retries = generator_config.get('max_retries', 20)
         self.batch_size = generator_config.get('batch_size', 1)
         self.top_p = generator_config.get('top_p', 1.0)
@@ -253,35 +247,34 @@ class VLLMClient(BaseLLMClient):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         vllm_config = config.get('generator', {}).get('vllm', {})
-        
-        self.model_path = vllm_config.get('model')
-        self.gpu_memory_utilization = vllm_config.get('gpu_memory_utilization', 0.9)
-        self.max_model_len = vllm_config.get('max_model_len', 1024)
-        self.tensor_parallel_size = vllm_config.get('tensor_parallel_size', 1)
-        self.use_chat_template = vllm_config.get('use_chat_template', True)
-        self.system_message = vllm_config.get('system_message', "You are a helpful assistant.")
+
+        self.model = vllm_config.get('model')
         self.seed = vllm_config.get('seed', 42)
+        self.use_chat_template = vllm_config.get('use_chat_template', True)
+        self.tensor_parallel_size = vllm_config.get('tensor_parallel_size', 1)
+        self.gpu_memory_utilization = vllm_config.get('gpu_memory_utilization', 0.9)
+        self.system_message = vllm_config.get('system_message', "You are a helpful assistant.")
         
-        if not self.model_path:
+        if not self.model:
             raise ValueError("vLLM requires model_path to be specified in config")
         
         self._initialize_vllm()
     
     def _initialize_vllm(self):
         try:
-            logger.info(f"Initializing vLLM with model: {self.model_path}")
+            logger.info(f"Initializing vLLM with model: {self.model}")
             
             self.llm = LLM(
-                model=self.model_path,
+                model=self.model,
                 gpu_memory_utilization=self.gpu_memory_utilization,
-                max_model_len=self.max_model_len,
+                max_model_len=self.max_tokens,
                 tensor_parallel_size=self.tensor_parallel_size,
                 trust_remote_code=True
             )
             
             self.tokenizer = self.llm.get_tokenizer()
             
-            logger.info(f"✓ vLLM initialized successfully with model: {self.model_path}")
+            logger.info(f"✓ vLLM initialized successfully with model: {self.model}")
         except Exception as e:
             logger.error(f"Failed to initialize vLLM: {e}")
             raise
@@ -356,9 +349,9 @@ class LLMClientFactory:
 
 class CoTGenerator:
     def __init__(self, config: Dict[str, Any], backend: str = None):
-        self.config = config
         generator_config = config.get('generator', {})
-        
+
+        self.config = config
         self.backend = backend or generator_config.get('backend', 'openai')
         self.llm_client = LLMClientFactory.create_client(config, self.backend)
         self.should_validate_cot_steps = generator_config.get('validate_cot_steps', True)
@@ -502,7 +495,6 @@ Important:
                         logger.debug(f"Found {len(queries)} queries with pattern: {pattern[:30]}...")
                     break
         
-        # Remove duplicates while preserving order
         seen = set()
         unique_queries = []
         for query in all_queries:
@@ -768,19 +760,14 @@ Important:
             if re.search(pattern, content_lower):
                 return True
         
-        # Very short content that's not meaningful
         if len(content_lower) < 4:
             return True
         
-        # Content that's just a single word or two without context
         words = content_lower.split()
         if len(words) <= 2:
-            # Allow short facts
             if not any(word.isdigit() for word in words):
-                # If no numbers, probably incomplete
                 return True
         
-        # Check for cut-off endings
         cutoff_endings = [' a', ' an', ' the', ' to', ' of', ' for', ' with', ' without', ' and', ' or', ' but', ' then', ' so']
         for ending in cutoff_endings:
             if content_lower.endswith(ending):
@@ -1832,7 +1819,16 @@ def main(args):
     
     if backend == 'openai':
         llm_config = generator_config.setdefault('llm_api', {})
-        
+    else:
+        llm_config = generator_config.setdefault('vllm', {})
+    
+    batch_size = config['common'].get('batch_size', 64) if not args.batch_size else args.batch_size
+    generator_config['batch_size'] = batch_size
+    llm_config['batch_size'] = batch_size
+    llm_config['temperature'] = generator_config['temperature']
+    llm_config['max_retries'] = generator_config['max_retries']
+    
+    if backend == 'openai':
         if args.api_key:
             llm_config['api_key'] = args.api_key
         
@@ -1844,42 +1840,12 @@ def main(args):
         
         if 'model' not in llm_config or not llm_config['model']:
             llm_config['model'] = LLM_API_MODEL
-        
-        if args.batch_size:
-            generator_config['batch_size'] = args.batch_size
-            llm_config['batch_size'] = args.batch_size
-        elif 'batch_size' not in generator_config:
-            generator_config['batch_size'] = 1
-            llm_config['batch_size'] = 1
-        else:
-            llm_config['batch_size'] = generator_config['batch_size']
     elif backend == 'vllm':
-        vllm_config = generator_config.setdefault('vllm', {})
-        
         if args.model:
-            vllm_config['model'] = args.model
-        elif 'model' not in vllm_config or not vllm_config['model']:
+            llm_config['model'] = args.model
+        elif 'model' not in llm_config or not llm_config['model']:
             logger.error("vLLM backend requires a model path. Use --model to specify a HuggingFace model path.")
             return
-        
-        if args.batch_size:
-            generator_config['batch_size'] = args.batch_size
-            vllm_config['batch_size'] = args.batch_size
-        elif 'batch_size' not in generator_config:
-            generator_config['batch_size'] = 8
-            vllm_config['batch_size'] = 8
-        else:
-            vllm_config['batch_size'] = generator_config['batch_size']
-        
-        if args.gpu_memory_utilization:
-            vllm_config['gpu_memory_utilization'] = args.gpu_memory_utilization
-        elif 'gpu_memory_utilization' not in vllm_config:
-            vllm_config['gpu_memory_utilization'] = 0.9
-        
-        if args.tensor_parallel_size:
-            vllm_config['tensor_parallel_size'] = args.tensor_parallel_size
-        elif 'tensor_parallel_size' not in vllm_config:
-            vllm_config['tensor_parallel_size'] = 1
     else:
         logger.error(f"Unknown backend: {backend}. Must be 'openai' or 'vllm'.")
         return
@@ -1889,11 +1855,6 @@ def main(args):
     elif 'temperature' not in generator_config:
         generator_config['temperature'] = 0.3
 
-    if backend == 'openai':
-        llm_config['temperature'] = generator_config['temperature']
-    else:
-        vllm_config['temperature'] = generator_config['temperature']
-    
     if args.output_dir:
         generator_config['output_dir'] = args.output_dir
     
@@ -1901,11 +1862,6 @@ def main(args):
         generator_config['max_retries'] = args.max_retries
     elif 'max_retries' not in generator_config:
         generator_config['max_retries'] = 20
-    
-    if backend == 'openai':
-        llm_config['max_retries'] = generator_config['max_retries']
-    else:
-        vllm_config['max_retries'] = generator_config['max_retries']
     
     if args.validate is not None:
         generator_config['validate_cot_steps'] = args.validate
@@ -1921,10 +1877,10 @@ def main(args):
             logger.info(f"  API Base: {llm_config.get('api_base')}")
             logger.info(f"  Model: {llm_config.get('model')}")
         else:
-            logger.info(f"  Model Path: {vllm_config.get('model', 'Not specified')}")
-            logger.info(f"  Batch Size: {vllm_config.get('batch_size')}")
-            logger.info(f"  GPU Memory Utilization: {vllm_config.get('gpu_memory_utilization')}")
-            logger.info(f"  Tensor Parallel Size: {vllm_config.get('tensor_parallel_size')}")
+            logger.info(f"  Model Path: {llm_config.get('model', 'Not specified')}")
+            logger.info(f"  Batch Size: {llm_config.get('batch_size')}")
+            logger.info(f"  GPU Memory Utilization: {llm_config.get('gpu_memory_utilization')}")
+            logger.info(f"  Tensor Parallel Size: {llm_config.get('tensor_parallel_size')}")
         
         logger.info(f"  Temperature: {generator_config.get('temperature')}")
     except Exception as e:
@@ -1941,22 +1897,21 @@ def main(args):
     if args.dataset not in GENERATOR_MAP:
         raise ValueError(f"Unknown dataset: {args.dataset}. Available: {list(GENERATOR_MAP.keys())}")
     
-    if args.mode == "train":
-        num_examples = args.num_examples or generator_config.get('num_train_examples')
-    else:
-        num_examples = args.num_examples or generator_config.get('num_test_examples')
-    
     logger.info(f"{'='*60}")
-    logger.info(f"Generating {args.mode} data for {args.dataset}")
+    logger.info(f"DATA GENERATION")
+    logger.info(f"{'='*60}")
+    logger.info(f"Dataset: {args.dataset}")
     logger.info(f"Backend: {backend}")
     
     if backend == 'openai':
         logger.info(f"API Service: {llm_config.get('api_base')}")
         logger.info(f"Model: {llm_config.get('model')}")
     else:
-        logger.info(f"Model: {vllm_config.get('model', 'Not specified')}")
-        logger.info(f"Batch Size: {vllm_config.get('batch_size')}")
+        logger.info(f"Model: {llm_config.get('model', 'Not specified')}")
+        logger.info(f"Batch Size: {llm_config.get('batch_size')}")
     
+    num_examples = args.num_examples
+
     logger.info(f"Mode: {args.mode}")
     logger.info(f"Examples: {num_examples or 'all'}")
     logger.info(f"{'='*60}")
@@ -1967,11 +1922,8 @@ def main(args):
     if args.mode == 'train':
         cot_gen.llm_client.print_summary()
     
-    logger.info(f"{'='*60}")
     logger.info(f"Generation Complete!")
     logger.info(f"Generated {len(results)} examples for {args.dataset} ({args.mode})")
-    logger.info(f"Backend used: {backend}")
-    logger.info(f"{'='*60}")
 
 if __name__ == '__main__':
     parser = HfArgumentParser(GeneratorArguments)

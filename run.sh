@@ -41,6 +41,7 @@ Usage: $0 [COMMAND] [OPTIONS]
 Commands:
   --generate              Run dataset generation
   --train                 Run model training
+  --rl MODE               Run RL training (MODE: dpo | grpo)
   --eval                  Run evaluation
   --clean                 Remove generated outputs and caches
   -h, --help              Show this help message
@@ -67,20 +68,24 @@ Generator Options:
 
 Training Options:
   --dataset DATASET       Dataset for training
-  --model-path MODEL      Base model or checkpoint path
-  --learning-rate LR      Learning rate
+  --model MODEL           Base model or checkpoint path
   --num-train NUM         Number of training examples
-  --checkpoint-dir DIR    Output checkpoint directory
+
+RL Training Options:
+  --rl MODE               RL training mode: dpo | grpo
+  --model MODEL           Base model path
 
 Evaluation Options:
   --dataset DATASET       Dataset for evaluation
-  --model-path MODEL      Trained model checkpoint
+  --model MODEL           Trained model checkpoint
   --num-test NUM          Number of test examples
 
 Examples:
   $0 --generate --dataset truthfulqa --mode train
-  $0 --train --dataset truthfulqa --model-path Qwen/Qwen3-4B
-  $0 --eval --dataset truthfulqa --model-path $CHECKPOINT_DIR
+  $0 --train --dataset truthfulqa --model Qwen/Qwen3-1.7B
+  $0 --rl dpo --dataset truthfulqa --model Qwen/Qwen3-1.7B
+  $0 --rl grpo --dataset truthfulqa --model Qwen/Qwen3-1.7B
+  $0 --eval --dataset truthfulqa --model $CHECKPOINT_DIR
 
 EOF
 }

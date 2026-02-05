@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-**Integrate reasoning benchmarks in minutes—not days**
+**Benchmark and enhance reasoning capabilities in large language models**
 
 ## Overview
 
@@ -12,8 +12,6 @@ ReasonBench makes it easy to evaluate how well Large Language Models separate **
 
 ### Installation & Setup
 
-Get started in minutes:
-
 ```bash
 # Install dependencies
 ./install.sh
@@ -21,12 +19,34 @@ Get started in minutes:
 # Generate Chain-of-Thought data (TruthfulQA example)
 ./run.sh --generate --dataset truthfulqa --mode train
 
-# Train your model
+# Train your model with standard fine-tuning
 ./run.sh --train --dataset truthfulqa
 
+# Train with Reinforcement Learning (DPO)
+./run.sh --train --rl dpo --dataset truthfulqa --model Qwen/Qwen3-1.7B
+
+# Train with Reinforcement Learning (GRPO)
+./run.sh --train --rl grpo --dataset truthfulqa --model Qwen/Qwen3-1.7B
+
 # Evaluate performance
-./run.sh --eval --model-path <your_model_path> --dataset truthfulqa
+./run.sh --eval --model <your_model_path> --dataset truthfulqa
 ```
+
+## Reinforcement Learning Training
+
+ReasonBench now supports reinforcement learning fine-tuning:
+
+### Direct Preference Optimization (DPO)
+```bash
+./run.sh --train --rl dpo --dataset truthfulqa --model Qwen/Qwen3-1.7B
+```
+
+### Group Relative Policy Optimization (GRPO)
+```bash
+./run.sh --train --rl grpo --dataset truthfulqa --model Qwen/Qwen3-1.7B
+```
+
+Configuration for RL training is in `conf/rl.yaml`.
 
 ## Direct Dataset Download
 
@@ -218,14 +238,23 @@ class YourDatasetGenerator(DatasetGenerator):
 
 class YourDataset(JsonBasedData):
     INSTRUCTION = "Your custom instruction for this dataset."
-    
-    def get_instruction(self) -> str:
-        return self.INSTRUCTION
 ```
 
 The dataset class should implement the `get_instruction()` method to provide dataset-specific instructions. The `JsonBasedData` base class handles JSON-formatted data loading and preprocessing.
 
 **Note**: Even if you download a dataset directly using the `./install.sh --dataset` command, you still need to complete both steps above to use the dataset for training or evaluation.
+
+## Model Evaluation
+
+The evaluation script automatically detects different model types:
+- Standard fine-tuned models
+- RL-trained models (DPO/GRPO)
+- Custom PEFT models
+
+All can be evaluated with the same command:
+```bash
+./run.sh --eval --model <model_path_or_checkpoint> --dataset <dataset_name>
+```
 
 ## License
 
