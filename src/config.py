@@ -108,7 +108,7 @@ def update_dataclass_from_config(
                         model_arg_key = f"lora_{lora_key}"
                         if hasattr(dataclass_obj, model_arg_key):
                             setattr(dataclass_obj, model_arg_key, lora_value)
-                elif hasattr(dataclass_obj, key) and key not in protected_fields:
+                elif hasattr(dataclass_obj, key) and ((key not in protected_fields) or (not getattr(dataclass_obj, key))):
                     setattr(dataclass_obj, key, value)
     
     return dataclass_obj
@@ -116,6 +116,22 @@ def update_dataclass_from_config(
 def setup_directories(config: Dict[str, Any]):
     os.makedirs(DEFAULT_OUTPUT_DIR, exist_ok=True)
     os.makedirs(DEFAULT_CHECKPOINT_DIR, exist_ok=True)
+
+def get_world_size(args) -> int:
+    if hasattr(args, 'world_size') and args.world_size is not None:
+        return args.world_size
+    
+    if hasattr(args, 'n_gpu') and args.n_gpu is not None:
+        return args.n_gpu
+    
+    import torch
+    if torch.distributed.is_initialized():
+        try:
+            return torch.distributed.get_world_size()
+        except:
+            pass
+
+    return 1
 
 def get_config_value(
     config: Dict[str, Any],

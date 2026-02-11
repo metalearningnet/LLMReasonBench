@@ -816,7 +816,6 @@ class JsonBasedData(BaseData):
         
         if not os.path.exists(json_path):
             error_msg = f"JSON file not found: {json_path}"
-            logger.error(error_msg)
             raise FileNotFoundError(error_msg)
         
         logger.debug(f"Loading data from {json_path}")

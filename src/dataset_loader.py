@@ -114,9 +114,6 @@ def save_as_json(
     
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(examples, f, indent=indent, ensure_ascii=False)
-    
-    logger.info(f"Dataset saved to: {output_path}")
-    logger.info(f"File size: {output_path.stat().st_size / 1024 / 1024:.2f} MB")
 
 def main():
     parser = argparse.ArgumentParser(

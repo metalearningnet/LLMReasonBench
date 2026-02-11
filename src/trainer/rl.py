@@ -1,20 +1,25 @@
 import json
 import copy
 import torch
+import string
+import difflib
+import logging
 import transformers
 from pathlib import Path
-from config import logger
 from typing import Optional, Dict, Any, Union
 from dataclasses import dataclass, field, asdict
 from datasets import Dataset as HFDataset, load_dataset
 from trl import GRPOConfig, GRPOTrainer, DPOTrainer, DPOConfig
 from peft import LoraConfig, TaskType, get_peft_model, PeftModel, get_peft_model_state_dict
-from config import DEFAULT_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR, load_rl_config, load_config as load_base_config
+from config import DEFAULT_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR, logger, load_rl_config, load_config as load_base_config
 from transformers import (
     AutoTokenizer,
     PreTrainedTokenizer,
     AutoModelForCausalLM
 )
+
+logging.getLogger("transformers.generation.configuration_utils").setLevel(logging.ERROR)
+logging.getLogger("transformers.configuration_utils").setLevel(logging.ERROR)
 
 @dataclass
 class RLTrainingArguments(transformers.TrainingArguments):
@@ -78,7 +83,7 @@ class RLConfigManager:
             "eval_steps": train_config.get("eval_steps", 50),
             "save_steps": train_config.get("save_steps", 100),
             "warmup_steps": train_config.get("warmup_steps", 100),
-            "logging_steps": train_config.get("logging_steps", 10),
+            "logging_steps": train_config.get("logging_steps", 1000),
             "learning_rate": train_config.get("learning_rate", 1e-5),
             "num_train_epochs": train_config.get("num_train_epochs", 1),
             "save_total_limit": train_config.get("save_total_limit", 1),
@@ -113,18 +118,39 @@ class RLConfigManager:
         elif training_mode == "grpo":
             grpo_config = rl_config.get("grpo", {})
             dataset_name = base_dataset_name if base_dataset_name else grpo_config["dataset"]
-            answer_fields = grpo_config["field_mappings"]["answer_fields"]
-            score_fields = grpo_config["field_mappings"]["score_fields"]
+            field_mappings = grpo_config.get("field_mappings", {})
+            if not field_mappings:
+                raise ValueError("GRPO config must contain 'field_mappings'")
+            
+            answer_fields = field_mappings.get("answer_fields", {})
+            score_fields = field_mappings.get("score_fields", {})
+            
+            if not answer_fields or not score_fields:
+                raise ValueError("GRPO field_mappings must contain 'answer_fields' and 'score_fields'")
+            
             field_mappings = {
                 "answer_fields": answer_fields,
                 "score_fields": score_fields
             }
+            base_batch_size = max(1, common_config.get("batch_size", 1))
+            num_rollouts = grpo_config.get("num_rollouts", 4)
+            if num_rollouts != answer_fields.get("count", 4):
+                logger.warning(f"num_rollouts={num_rollouts}, answer count={answer_fields.get('count', 4)}. ")
+            
+            if base_batch_size % num_rollouts != 0:
+                adjusted_batch_size = ((base_batch_size + num_rollouts - 1) // num_rollouts) * num_rollouts
+                logger.warning(f"Adjusting batch_size from {base_batch_size} to {adjusted_batch_size} to be divisible by num_rollouts={num_rollouts}")
+                batch_size = adjusted_batch_size
+            else:
+                batch_size = base_batch_size
+            
             args_dict.update({
                 "dataset_name": dataset_name,
                 "beta": grpo_config.get("beta", 0.1),
-                "per_device_train_batch_size": max(1, common_config.get("batch_size", 1)),
+                "per_device_train_batch_size": batch_size,
                 "per_device_eval_batch_size": 1,
-                "grpo_field_mappings": field_mappings
+                "grpo_field_mappings": field_mappings,
+                "num_rollouts": num_rollouts
             })
         
         return RLTrainingArguments(**args_dict)
@@ -206,149 +232,6 @@ class BaseRLTrainer:
         
         logger.info(f"Model saved to {output_dir}")
 
-class RLDPOTrainer(BaseRLTrainer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-        ref_model = copy.deepcopy(self.model)
-        for param in ref_model.parameters():
-            param.requires_grad = False
-        
-        dpo_config = DPOConfig(
-            output_dir=self.args.output_dir,
-            per_device_train_batch_size=self.args.per_device_train_batch_size,
-            per_device_eval_batch_size=self.args.per_device_eval_batch_size,
-            fp16=self.args.fp16,
-            bf16=self.args.bf16,
-            learning_rate=self.args.learning_rate,
-            num_train_epochs=self.args.num_train_epochs,
-            logging_steps=self.args.logging_steps,
-            save_steps=self.args.save_steps,
-            eval_steps=self.args.eval_steps,
-            save_total_limit=self.args.save_total_limit,
-            warmup_steps=self.args.warmup_steps,
-            gradient_accumulation_steps=self.args.gradient_accumulation_steps,
-            seed=self.args.seed,
-            beta=self.args.beta,
-            loss_type=self.args.dpo_loss_type,
-            model_init_kwargs=self.args.model_init_kwargs,
-            ref_model_init_kwargs=self.args.ref_model_init_kwargs,
-            max_length=self.args.max_prompt_length + self.args.max_completion_length,
-            max_prompt_length=self.args.max_prompt_length,
-            max_completion_length=self.args.max_completion_length
-        )
-        
-        self.trltrainer = DPOTrainer(
-            model=self.model,
-            ref_model=ref_model,
-            args=dpo_config,
-            train_dataset=self.train_dataset,
-            eval_dataset=self.eval_dataset
-        )
-        
-        logger.info(f"RLDPOTrainer initialized with beta={self.args.beta}, loss_type={self.args.dpo_loss_type}")
-    
-    def train(self):
-        try:
-            train_result = self.trltrainer.train()
-            logger.info("DPO training completed successfully")
-            
-            if self.args.checkpoint_dir:
-                self.save_model(self.args.checkpoint_dir)
-            
-            return {
-                "train_metrics": train_result.metrics,
-                "output_dir": self.args.checkpoint_dir
-            }
-        except Exception as e:
-            logger.error(f"Error during DPO training: {e}")
-            raise
-
-def grpo_dataset_score_reward(prompts, completions, **kwargs):
-    batch_answers = kwargs.get("answers", [])
-    batch_scores = kwargs.get("scores", [])
-    
-    if not batch_answers or not batch_scores:
-        if "batch" in kwargs:
-            batch = kwargs["batch"]
-            batch_answers = batch.get("answers", [])
-            batch_scores = batch.get("scores", [])
-        else:
-            batch_answers = kwargs.get("answers", kwargs.get("batch_answers", []))
-            batch_scores = kwargs.get("scores", kwargs.get("batch_scores", []))
-    
-    if not batch_answers or not batch_scores:
-        raise ValueError("GRPO reward_fn requires 'answers' and 'scores' in the batch")
-    
-    if len(batch_answers) != len(completions):
-        raise ValueError(
-            f"Batch size ({len(batch_answers)}) does not match number of completions ({len(completions)})"
-        )
-    
-    rewards = []
-    for answers, scores, completion in zip(batch_answers, batch_scores, completions):
-        matched_score = 0.0
-        for ans, score in zip(answers, scores):
-            if ans and ans.strip() and ans.strip() in completion:
-                matched_score = float(score)
-                break
-        rewards.append(matched_score)
-    
-    return rewards
-
-class RLGRPOTrainer(BaseRLTrainer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-        grpo_config = GRPOConfig(
-            output_dir=self.args.output_dir,
-            per_device_train_batch_size=self.args.per_device_train_batch_size,
-            per_device_eval_batch_size=self.args.per_device_eval_batch_size,
-            learning_rate=self.args.learning_rate,
-            num_train_epochs=self.args.num_train_epochs,
-            gradient_accumulation_steps=self.args.gradient_accumulation_steps,
-            max_prompt_length=self.args.max_prompt_length,
-            max_completion_length=self.args.max_completion_length,
-            num_generations=self.args.num_rollouts,
-            beta=self.args.beta,
-            temperature=self.args.temperature,
-            top_p=self.args.top_p,
-            seed=self.args.seed
-        )
-
-        def grpo_reward_wrapper(prompts, completions, **kwargs):
-            return grpo_dataset_score_reward(prompts, completions, **kwargs)
-
-        self.trltrainer = GRPOTrainer(
-            model=self.model,
-            args=grpo_config,
-            reward_funcs=grpo_reward_wrapper,
-            train_dataset=self.train_dataset,
-            eval_dataset=self.eval_dataset,
-            processing_class=None
-        )
-        
-        logger.info(
-            f"RLGRPOTrainer initialized: beta={self.args.beta}, "
-            f"top_p={self.args.top_p}, temperature={self.args.temperature}"
-        )
-    
-    def train(self):
-        try:
-            train_result = self.trltrainer.train()
-            logger.info("GRPO training completed successfully")
-            
-            if self.args.checkpoint_dir:
-                self.save_model(self.args.checkpoint_dir)
-            
-            return {
-                "train_metrics": train_result.metrics,
-                "output_dir": self.args.checkpoint_dir
-            }
-        except Exception as e:
-            logger.error(f"Error during GRPO training: {e}")
-            raise
-
 def preprocess_dpo_dataset(dataset, rl_training_args, logger):
     field_mappings = rl_training_args.dpo_field_mappings
     if field_mappings is None:
@@ -414,70 +297,234 @@ def preprocess_dpo_dataset(dataset, rl_training_args, logger):
     
     return dataset
 
+class RLDPOTrainer(BaseRLTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        ref_model = copy.deepcopy(self.model)
+        for param in ref_model.parameters():
+            param.requires_grad = False
+        
+        dpo_config = DPOConfig(
+            output_dir=self.args.output_dir,
+            per_device_train_batch_size=self.args.per_device_train_batch_size,
+            per_device_eval_batch_size=self.args.per_device_eval_batch_size,
+            fp16=self.args.fp16,
+            bf16=self.args.bf16,
+            learning_rate=self.args.learning_rate,
+            num_train_epochs=self.args.num_train_epochs,
+            logging_steps=self.args.logging_steps,
+            save_steps=self.args.save_steps,
+            eval_steps=self.args.eval_steps,
+            save_total_limit=self.args.save_total_limit,
+            warmup_steps=self.args.warmup_steps,
+            gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+            seed=self.args.seed,
+            beta=self.args.beta,
+            loss_type=self.args.dpo_loss_type,
+            model_init_kwargs=self.args.model_init_kwargs,
+            ref_model_init_kwargs=self.args.ref_model_init_kwargs,
+            max_length=self.args.max_prompt_length + self.args.max_completion_length,
+            max_prompt_length=self.args.max_prompt_length,
+            max_completion_length=self.args.max_completion_length
+        )
+        
+        self.trltrainer = DPOTrainer(
+            model=self.model,
+            ref_model=ref_model,
+            args=dpo_config,
+            train_dataset=self.train_dataset,
+            eval_dataset=self.eval_dataset
+        )
+        
+        logger.info(f"RLDPOTrainer initialized with beta={self.args.beta}, loss_type={self.args.dpo_loss_type}")
+    
+    def train(self):
+        try:
+            train_result = self.trltrainer.train()
+            logger.info("DPO training completed successfully")
+            
+            if self.args.checkpoint_dir:
+                self.save_model(self.args.checkpoint_dir)
+            
+            return {
+                "train_metrics": train_result.metrics,
+                "output_dir": self.args.checkpoint_dir
+            }
+        except Exception as e:
+            logger.error(f"Error during DPO training: {e}")
+            raise
+
+def normalize_text(s: str) -> str:
+    if not isinstance(s, str):
+        return str(s)
+    
+    s = s.lower().strip()
+    
+    translator = str.maketrans('', '', string.punctuation)
+    s = s.translate(translator)
+    
+    return s
+
+def calculate_similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
 def preprocess_grpo_dataset(dataset, rl_training_args, logger):
     field_mappings = rl_training_args.grpo_field_mappings
-    if field_mappings is None:
-        raise ValueError("GRPO field mappings must be provided")
-
     answer_fields = field_mappings.get("answer_fields", {})
     score_fields = field_mappings.get("score_fields", {})
 
     answer_prefix = answer_fields.get("prefix", "A")
-    answer_count = answer_fields.get("count", 4)
     score_prefix = score_fields.get("prefix", "score_A")
-    score_count = score_fields.get("count", 4)
+    count = answer_fields.get("count", 4)
+    
+    num_train_limit = getattr(rl_training_args, "num_train", None)
+    if num_train_limit is not None and num_train_limit > 0:
+        logger.info(f"Limiting dataset to first {num_train_limit} valid examples.")
+    
+    processed = []
+    dropped_zero_reward = 0
+    dropped_empty = 0
+    
+    logger.info("Starting GRPO dataset preprocessing...")
 
-    expected_answer_cols = [f"{answer_prefix}{i}" for i in range(answer_count)]
-    expected_score_cols = [f"{score_prefix}{i}" for i in range(score_count)]
+    for i, example in enumerate(dataset):
+        if num_train_limit is not None and len(processed) >= num_train_limit:
+            logger.info(f"Reached num_train limit ({num_train_limit}). Stopping preprocessing.")
+            break
 
-    available_answer_cols = [col for col in expected_answer_cols if col in dataset.column_names]
-    available_score_cols = [col for col in expected_score_cols if col in dataset.column_names]
+        prompt = str(example.get("prompt", "")).strip()
+        if not prompt:
+            dropped_empty += 1
+            continue
 
-    if not available_answer_cols:
-        raise ValueError(f"No answer columns found. Expected: {expected_answer_cols}")
-    if not available_score_cols:
-        raise ValueError(f"No score columns found. Expected: {expected_score_cols}")
-
-    missing_answer_cols = set(expected_answer_cols) - set(available_answer_cols)
-    missing_score_cols = set(expected_score_cols) - set(available_score_cols)
-
-    if missing_answer_cols:
-        logger.warning(f"Missing answer columns (will fill with empty string): {missing_answer_cols}")
-    if missing_score_cols:
-        logger.warning(f"Missing score columns (will fill with 0.0): {missing_score_cols}")
-
-    def combine_answers_scores(example):
-        answers = [str(example.get(col, "")) for col in available_answer_cols]
+        answers = []
         scores = []
-        for col in available_score_cols:
-            val = example.get(col, 0.0)
-            try:
-                scores.append(float(val))
-            except (ValueError, TypeError):
-                scores.append(0.0)
 
-        min_len = min(len(answers), len(scores))
-        answers = answers[:min_len]
-        scores = scores[:min_len]
+        for k in range(count):
+            a_col = f"{answer_prefix}{k}"
+            s_col = f"{score_prefix}{k}"
+            
+            if a_col in example and s_col in example:
+                raw_ans = example[a_col]
+                raw_score = example[s_col]
+                
+                if raw_ans is not None and str(raw_ans).strip():
+                    try:
+                        scr = float(raw_score)
+                    except (ValueError, TypeError):
+                        scr = 0.0
+                    
+                    answers.append(str(raw_ans).strip())
+                    scores.append(scr)
 
-        return {
-            "prompt": example.get("prompt", ""),
+        if not scores or max(scores) <= 0.0:
+            dropped_zero_reward += 1
+            continue
+
+        processed.append({
+            "prompt": prompt,
             "answers": answers,
             "scores": scores
+        })
+
+    logger.info(f"Dataset Preprocessing Complete:")
+    logger.info(f"  - Final Size: {len(processed)}")
+    logger.info(f"  - Dropped (Empty/No Prompt): {dropped_empty}")
+    logger.info(f"  - Dropped (Max Score <= 0): {dropped_zero_reward}")
+    
+    return HFDataset.from_list(processed)
+
+class RLGRPOTrainer(BaseRLTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.prompt_to_reference = {}
+        
+        if self.train_dataset is not None:
+            for ex in self.train_dataset:
+                p = ex.get("prompt", "").strip()
+                if p:
+                    self.prompt_to_reference[p] = {
+                        "answers": ex.get("answers", []),
+                        "scores": ex.get("scores", [])
+                    }
+            logger.info(f"Built reference map for {len(self.prompt_to_reference)} unique prompts")
+        else:
+            logger.warning("train_dataset is None! Reference map is empty.")
+
+        def soft_match_reward_func(prompts, completions, **kwargs):
+            rewards = []
+            
+            for prompt, completion in zip(prompts, completions):
+                prompt_key = prompt.strip()
+                best_reward = 0.0
+                
+                if prompt_key in self.prompt_to_reference:
+                    ref = self.prompt_to_reference[prompt_key]
+                    
+                    completion_norm = normalize_text(completion)
+                    
+                    for ref_ans, ref_score in zip(ref["answers"], ref["scores"]):
+                        ref_score = float(ref_score)
+                        
+                        if ref_score <= 0:
+                            continue
+
+                        ref_ans_norm = normalize_text(ref_ans)
+                        current_match_score = 0.0
+
+                        if ref_ans_norm in completion_norm:
+                            current_match_score = ref_score
+                        else:
+                            similarity = calculate_similarity(ref_ans_norm, completion_norm)
+                            
+                            if similarity > 0.6:
+                                current_match_score = similarity * ref_score
+                        
+                        best_reward = max(best_reward, current_match_score)
+                
+                rewards.append(best_reward)
+            
+            return rewards
+        
+        grpo_config = GRPOConfig(
+            output_dir=self.args.output_dir,
+            per_device_train_batch_size=self.args.per_device_train_batch_size,
+            gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+            learning_rate=self.args.learning_rate,
+            num_train_epochs=self.args.num_train_epochs,
+            max_prompt_length=self.args.max_prompt_length,
+            max_completion_length=self.args.max_completion_length,
+            num_generations=self.args.num_rollouts, 
+            beta=self.args.beta,
+            seed=self.args.seed,
+            logging_steps=self.args.logging_steps,
+            save_steps=self.args.save_steps,
+        )
+
+        self.trltrainer = GRPOTrainer(
+            model=self.model,
+            args=grpo_config,
+            train_dataset=self.train_dataset,
+            eval_dataset=self.eval_dataset,
+            reward_funcs=soft_match_reward_func,
+            processing_class=self.tokenizer
+        )
+
+        logger.info(f"Initialized RLGRPOTrainer with {self.args.num_rollouts} rollouts")
+
+    def train(self):
+        logger.info("Starting Soft-Match GRPO training...")
+        train_result = self.trltrainer.train()
+        
+        if self.args.checkpoint_dir:
+            self.save_model(self.args.checkpoint_dir)
+            
+        return {
+            "train_metrics": train_result.metrics,
+            "output_dir": self.args.checkpoint_dir
         }
-
-    dataset = dataset.map(combine_answers_scores, batched=False, desc="Preprocessing GRPO dataset")
-
-    if rl_training_args.num_train is not None and rl_training_args.num_train > 0:
-        limit = min(rl_training_args.num_train, len(dataset))
-        dataset = dataset.select(range(limit))
-        logger.info(f"Limited dataset to {limit} examples (requested: {rl_training_args.num_train})")
-
-    logger.info(f"Processed GRPO dataset with {len(dataset)} examples")
-    logger.info(f"Using answer columns: {available_answer_cols}")
-    logger.info(f"Using score columns: {available_score_cols}")
-
-    return dataset
 
 def create_rl_trainer_from_config(
     config: Optional[Dict[str, Any]] = None,

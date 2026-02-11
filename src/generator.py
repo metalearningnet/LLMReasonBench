@@ -3,6 +3,7 @@ import time
 import json
 import random
 import openai
+import logging
 from tqdm import tqdm
 from pathlib import Path
 from vllm import LLM, SamplingParams
@@ -14,6 +15,9 @@ from config import (
     STEPS, COT_TOKEN_NAMES, MEMORY_TOKEN, MEMORY_TOKEN_NAME,
     load_config, load_datasets_config, logger, dataset_names
 )
+
+for logger_name in ["openai", "httpx", "httpcore", "urllib3"]:
+    logging.getLogger(logger_name).setLevel(logging.WARNING)
 
 @dataclass
 class GeneratorArguments:
@@ -70,8 +74,8 @@ class GeneratorArguments:
     backend: Optional[str] = field(
         default=None,
         metadata={
-            "choices": ["openai", "vllm"],
-            "help": "Backend to use for LLM generation. 'openai' for API calls, 'vllm' for local inference. If not specified, uses config value."
+            "choices": ["api", "vllm"],
+            "help": "LLM inference backend: 'api' for unified remote API access, 'vllm' for local inference."
         }
     )
     batch_size: Optional[int] = field(
@@ -91,7 +95,7 @@ class BaseLLMClient:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         generator_config = config.get('generator', {})
-        llm_config = generator_config.get('llm_api', {})
+        llm_config = generator_config.get('api', {})
         max_prompt_length = config['train']['max_prompt_length']
         max_completion_length = config['train']['max_completion_length']
         
@@ -132,7 +136,7 @@ class BaseLLMClient:
 class OpenAIClient(BaseLLMClient):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        llm_config = config.get('generator', {}).get('llm_api', {})
+        llm_config = config.get('generator', {}).get('api', {})
         
         self.api_key = llm_config.get('api_key', '')
         self.api_base = llm_config.get('api_base', LLM_API_BASE)
@@ -249,7 +253,7 @@ class VLLMClient(BaseLLMClient):
         vllm_config = config.get('generator', {}).get('vllm', {})
 
         self.model = vllm_config.get('model')
-        self.seed = vllm_config.get('seed', 42)
+        self.seed = config['common'].get('seed', 42)
         self.use_chat_template = vllm_config.get('use_chat_template', True)
         self.tensor_parallel_size = vllm_config.get('tensor_parallel_size', 1)
         self.gpu_memory_utilization = vllm_config.get('gpu_memory_utilization', 0.9)
@@ -338,21 +342,21 @@ class VLLMClient(BaseLLMClient):
 class LLMClientFactory:
     @staticmethod
     def create_client(config: Dict[str, Any], backend: str = None) -> BaseLLMClient:
-        backend = backend or config.get('generator', {}).get('backend', 'openai')
+        backend = backend or config.get('generator', {}).get('backend', 'api')
         
-        if backend == 'openai':
+        if backend == 'api':
             return OpenAIClient(config)
         elif backend == 'vllm':
             return VLLMClient(config)
         else:
-            raise ValueError(f"Unknown backend: {backend}. Choose 'openai' or 'vllm'.")
+            raise ValueError(f"Unknown backend: {backend}. Choose 'api' or 'vllm'.")
 
 class CoTGenerator:
     def __init__(self, config: Dict[str, Any], backend: str = None):
         generator_config = config.get('generator', {})
 
         self.config = config
-        self.backend = backend or generator_config.get('backend', 'openai')
+        self.backend = backend or generator_config.get('backend', 'api')
         self.llm_client = LLMClientFactory.create_client(config, self.backend)
         self.should_validate_cot_steps = generator_config.get('validate_cot_steps', True)
         self.require_memory_before_reason = generator_config.get('require_memory_before_reason', False)
@@ -1709,7 +1713,7 @@ class DatasetGenerator:
         return (backend == 'vllm' and self.batch_size > 1 and split != "test")
     
     def _generate_for_split(self, data, split: str, num_examples: Optional[int] = None) -> List[Dict]:
-        backend = self.cot_generator.config.get('generator', {}).get('backend', 'openai')
+        backend = self.cot_generator.config.get('generator', {}).get('backend', 'api')
         output_file = self.get_output_filename(split)
         results = []
         
@@ -1800,7 +1804,7 @@ def main(args):
         config = load_config(args.config)
     except FileNotFoundError as e:
         logger.warning(f"Config file not found: {e}")
-        config = {'generator': {'llm_api': {}, 'vllm': {}}}
+        config = {'generator': {'api': {}, 'vllm': {}}}
     
     config['debug'] = args.debug if args.debug is not None else False
     generator_config = config.setdefault('generator', {})
@@ -1813,12 +1817,12 @@ def main(args):
         backend = generator_config['backend']
         logger.info(f"Using backend from config: {backend}")
     else:
-        backend = "openai"
+        backend = "api"
         generator_config['backend'] = backend
         logger.info(f"Using default backend: {backend}")
     
-    if backend == 'openai':
-        llm_config = generator_config.setdefault('llm_api', {})
+    if backend == 'api':
+        llm_config = generator_config.setdefault('api', {})
     else:
         llm_config = generator_config.setdefault('vllm', {})
     
@@ -1828,7 +1832,7 @@ def main(args):
     llm_config['temperature'] = generator_config['temperature']
     llm_config['max_retries'] = generator_config['max_retries']
     
-    if backend == 'openai':
+    if backend == 'api':
         if args.api_key:
             llm_config['api_key'] = args.api_key
         
@@ -1847,7 +1851,7 @@ def main(args):
             logger.error("vLLM backend requires a model path. Use --model to specify a HuggingFace model path.")
             return
     else:
-        logger.error(f"Unknown backend: {backend}. Must be 'openai' or 'vllm'.")
+        logger.error(f"Unknown backend: {backend}. Must be 'api' or 'vllm'.")
         return
 
     if args.temperature is not None:
@@ -1873,7 +1877,7 @@ def main(args):
         cot_gen = CoTGenerator(config, backend)
         logger.info(f"✓ LLM service configured with backend: {backend}")
         
-        if backend == 'openai':
+        if backend == 'api':
             logger.info(f"  API Base: {llm_config.get('api_base')}")
             logger.info(f"  Model: {llm_config.get('model')}")
         else:
@@ -1903,7 +1907,7 @@ def main(args):
     logger.info(f"Dataset: {args.dataset}")
     logger.info(f"Backend: {backend}")
     
-    if backend == 'openai':
+    if backend == 'api':
         logger.info(f"API Service: {llm_config.get('api_base')}")
         logger.info(f"Model: {llm_config.get('model')}")
     else:

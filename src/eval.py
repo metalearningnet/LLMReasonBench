@@ -74,7 +74,7 @@ class DataArguments:
         }
     )
     seed: Optional[int] = field(default=42)
-    batch_size: Optional[int] = field(default=1)
+    batch_size: Optional[int] = field(default=None)
     num_test: Optional[int] = field(default=None)
 
 class TokenizerFactory:
@@ -1414,11 +1414,14 @@ def evaluate() -> float:
     
     model_args = update_dataclass_from_config(model_args, config, ['common', 'eval'])
     data_args = update_dataclass_from_config(data_args, config, ['common', 'eval'])
+
+    if not data_args.batch_size:
+        data_args.batch_size = config['common']['batch_size']
     
     setup_directories(config)
     
     if model_args.output_dir is None:
-        model_args.output_dir = DEFAULT_EVAL_OUTPUT_DIR
+        model_args.output_dir = str(DEFAULT_EVAL_OUTPUT_DIR)
         logger.info(f"Using default output directory: {model_args.output_dir}")
     
     if model_args.hf_hub_token:

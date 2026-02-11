@@ -333,39 +333,9 @@ install_dataset() {
 
     if python "$DATASET_LOADER_SCRIPT" "${CMD_ARGS[@]}"; then
         local OUTPUT_FILE="${DATASET_OUTPUT_DIR}/${DATASET_NAME}_${DATASET_SPLIT}.json"
-        if [[ -f "$OUTPUT_FILE" ]]; then
-            local FILE_SIZE=$(du -h "$OUTPUT_FILE" | cut -f1)
-            if command -v jq &> /dev/null; then
-                local SAMPLE_COUNT=$(jq length "$OUTPUT_FILE")
-                log_info "Dataset successfully downloaded:"
-                log_info "  File: $OUTPUT_FILE"
-                log_info "  Size: $FILE_SIZE"
-                log_info "  Examples: $SAMPLE_COUNT"
-            else
-                log_info "Dataset successfully downloaded:"
-                log_info "  File: $OUTPUT_FILE"
-                log_info "  Size: $FILE_SIZE"
-                log_info "  Examples: (install 'jq' to count: 'sudo apt install jq' or 'brew install jq')"
-            fi
-        else
-            local ALTERNATIVE_FILE="${DATASET_OUTPUT_DIR}/${DATASET_NAME}.json"
-            if [[ -f "$ALTERNATIVE_FILE" ]]; then
-                local FILE_SIZE=$(du -h "$ALTERNATIVE_FILE" | cut -f1)
-                if command -v jq &> /dev/null; then
-                    local SAMPLE_COUNT=$(jq length "$ALTERNATIVE_FILE")
-                    log_info "Dataset successfully downloaded:"
-                    log_info "  File: $ALTERNATIVE_FILE"
-                    log_info "  Size: $FILE_SIZE"
-                    log_info "  Examples: $SAMPLE_COUNT"
-                else
-                    log_info "Dataset successfully downloaded:"
-                    log_info "  File: $ALTERNATIVE_FILE"
-                    log_info "  Size: $FILE_SIZE"
-                fi
-            else
-                log_warning "Dataset download completed but output file not found."
-                log_warning "Expected: $OUTPUT_FILE or $ALTERNATIVE_FILE"
-            fi
+        if [[ ! -f "$OUTPUT_FILE" ]]; then
+            log_warning "Dataset download completed but output file not found."
+            log_warning "Expected: $OUTPUT_FILE"
         fi
     else
         log_error "Failed to download dataset. Check the error messages above."

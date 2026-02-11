@@ -4,7 +4,7 @@ common:
 
   dataset: "truthfulqa"                     # Default dataset
   hf_hub_token: ""                          # Hugging Face token
-  batch_size: 4                             # Batch size for training or evaluation
+  batch_size: 1                             # Batch size for training or evaluation
   load_in_8bit: false                       # Load model in 8-bit quantization
   load_in_4bit: false                       # Load model in 4-bit quantization
   seed: 42                                  # Random seed for reproducibility
@@ -37,15 +37,15 @@ train:
   max_prompt_length: 512                    # Maximum token length for the input prompt
   max_completion_length: 1024               # Maximum token length for the model's completion
   warmup_steps: 100                         # Warmup steps for scheduler
-  gradient_accumulation_steps: 4            # Gradient accumulation steps
-  logging_steps: 10                         # Log every N steps
-  eval_steps: 50                            # Evaluate every N steps
-  save_steps: 100                           # Save checkpoint every N steps
+  gradient_accumulation_steps: 1            # Gradient accumulation steps
+  logging_steps: 1000                       # Log every N steps
+  eval_steps: null                          # Evaluate every N steps
+  save_steps: 0                             # Save checkpoint every N steps
   save_total_limit: 1                       # Keep only last N checkpoints
   fp16: true                                # Use mixed precision training
 
 generator:
-  backend: "vllm"                           # 'openai' | 'vllm'
+  backend: "vllm"                           # 'api' | 'vllm'
   mode: "train"                             # Default mode for generation
   temperature: 0.3                          # Temperature for generation
   top_p: 1.0                                # Nucleus sampling parameter
@@ -62,21 +62,18 @@ generator:
   validate_cot_steps: true                  # Whether to validate the quality and structure of generated Chain-of-Thought steps
   max_retries: 1                            # Maximum number of retry attempts
 
-  llm_api:                                  # OpenAI API configuration (used when backend='openai')
+  api:                                      # API configuration (used when backend='api')
     api_key: ""                             # API key for the LLM service
     api_base: "https://api.openai.com/v1"   # API endpoint URL
     timeout: 60                             # Request timeout in seconds
     retry_min_wait: 1                       # Minimum wait between retries (seconds)
     retry_max_wait: 60                      # Maximum wait between retries (seconds)
-
     model: "gpt-4o"
 
   vllm:                                     # vLLM configuration (used when backend='vllm')
-    seed: 42                                # Random seed for reproducibility
     tensor_parallel_size: 1                 # Tensor parallelism (number of GPUs)
     gpu_memory_utilization: 0.8             # GPU memory utilization (0.0-1.0)
     use_chat_template: true                 # Whether to use chat template for formatting
-
     model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
     system_message: "You are a helpful assistant."
 

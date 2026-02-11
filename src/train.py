@@ -95,6 +95,8 @@ class TrainingArguments(transformers.TrainingArguments):
     checkpoint_dir: str = field(default=str(DEFAULT_CHECKPOINT_DIR))
     max_prompt_length: Optional[int] = field(default=512)
     max_completion_length: Optional[int] = field(default=1024)
+    per_device_train_batch_size: Optional[int] = field(default=8)
+    per_device_eval_batch_size: Optional[int] = field(default=8)
 
 def log_trainable_parameters(model: torch.nn.Module):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -328,7 +330,7 @@ def train_rl_mode(rl_mode: str, data_args: DataArguments, model_args: ModelArgum
         config['common']['lora_config']['target_modules'] = model_args.lora_target_modules
     
     if training_args.output_dir:
-        config['train']['output_dir'] = training_args.output_dir
+        config['train']['output_dir'] = str(training_args.output_dir)
     
     if training_args.learning_rate:
         config['train']['learning_rate'] = training_args.learning_rate
@@ -385,7 +387,6 @@ def train_rl_mode(rl_mode: str, data_args: DataArguments, model_args: ModelArgum
         results = trainer.train()
         
         logger.info(f"\nRL training completed successfully!")
-        logger.info(f"Results: {results}")
         
         if wandb_run:
             wandb.log(results.get("train_metrics", {}))
@@ -434,6 +435,10 @@ def train():
     model_args = update_dataclass_from_config(model_args, config, ['common', 'train'])
     data_args = update_dataclass_from_config(data_args, config, ['common', 'train'])
     training_args = update_dataclass_from_config(training_args, config, ['common', 'train'])
+
+    if 'batch_size' in config['common']:
+        training_args.per_device_train_batch_size = config['common']['batch_size']
+        training_args.per_device_eval_batch_size = config['common']['batch_size']
     
     logger.info("Starting training process")
     logger.info(f"Model arguments: {model_args}")
@@ -491,7 +496,7 @@ def train():
         eval_dataset = data_class(data_args.dataset, "test", config=data_config)
         logger.info(f"Evaluation dataset loaded successfully: {len(eval_dataset)} examples")
     except Exception as e:
-        logger.error(f"Failed to load evaluation dataset: {e}")
+        logger.warning(f"No evaluation dataset: {e}")
         eval_dataset = None
     
     try:
@@ -611,8 +616,8 @@ def train():
         logger.info("WandB run finished")
     
     logger.info(f"Model: {model_args.model}")
-    logger.info(f"Model saved at: {training_args.checkpoint_dir}")
-    logger.info(f"Output directory: {training_args.output_dir}")
+    logger.info(f"Model saved at: {str(training_args.checkpoint_dir)}")
+    logger.info(f"Output directory: {str(training_args.output_dir)}")
 
 if __name__ == "__main__":
     train()
