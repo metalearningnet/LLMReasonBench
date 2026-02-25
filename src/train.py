@@ -7,7 +7,7 @@ from dataset import DATASET_MAP
 from trainer.lm import LMTrainer
 from preprocess import DataConfig
 from huggingface_hub import login
-from model_loader import AutoCausalLM
+from model_loader import CausalLM
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 from peft_model import PeftModelForCausalLMWrapper
@@ -42,7 +42,7 @@ class ModelArguments:
     hf_hub_token: Optional[str] = field(default="none")
     parameter_efficient_mode: Optional[str] = field(
         default="none",
-        metadata={"choices": ["none", "prompt-tuning", "lora", "lora+prompt-tuning"]}
+        metadata={"choices": ["none", "lora", "lora-tag", "lora-tag-tuning"]}
     )
     use_calculator: Optional[bool] = field(default=False)
     lora_module: Optional[str] = field(default="mlp")
@@ -111,10 +111,21 @@ def log_trainable_parameters(model: torch.nn.Module):
     
     return trainable_params, all_param, trainable_percent
 
-def enable_prompt_tuning(model: torch.nn.Module):
-    model.get_input_embeddings().new_embedding.weight.requires_grad = True
-    model.get_output_embeddings().new_linear.weight.requires_grad = True
-    logger.debug("Prompt tuning enabled")
+def enable_tag_tuning(model: torch.nn.Module):
+    input_emb = model.get_input_embeddings()
+    output_emb = model.get_output_embeddings()
+    
+    if hasattr(input_emb, 'new_embedding') and input_emb.new_embedding is not None:
+        input_emb.new_embedding.weight.requires_grad = True
+        logger.info("Enabled prompt tuning on input embeddings")
+    else:
+        logger.warning("Input embeddings lack 'new_embedding' – prompt tuning will not affect new tokens (none exist).")
+    
+    if hasattr(output_emb, 'new_linear') and output_emb.new_linear is not None:
+        output_emb.new_linear.weight.requires_grad = True
+        logger.info("Enabled prompt tuning on output embeddings")
+    else:
+        logger.warning("Output embeddings lack 'new_linear' – prompt tuning will not affect new tokens (none exist).")
 
 def create_tokenizer(model_name: str, cache_dir: Optional[str]) -> transformers.PreTrainedTokenizer:
     logger.debug(f"Creating tokenizer for model: {model_name}")
@@ -156,11 +167,13 @@ def create_tokenizer(model_name: str, cache_dir: Optional[str]) -> transformers.
     return tokenizer
 
 def create_cot_tokens(
-    model_args: ModelArguments,
+    config: dict,
     tokenizer: transformers.PreTrainedTokenizer
 ) -> tuple[Dict[str, str], List[int], List[int]]:
-    logger.info(f"Creating CoT tokens: enabled")
-    logger.debug(f"Defining CoT tokens: {COT_TOKENS}")
+    if 'tag' not in config['common']['parameter_efficient_mode']:
+        return []
+    
+    logger.info(f"Defining CoT tokens: {COT_TOKENS}")
     
     before_size = len(tokenizer)
     logger.info(f"Tokenizer vocabulary before adding CoT tokens: {before_size}")
@@ -170,7 +183,7 @@ def create_cot_tokens(
 
     after_size = len(tokenizer)
     logger.info(f"Tokenizer vocabulary after adding CoT tokens: {after_size}")
-    logger.info(f"Added {num_new} new token(s) to tokenizer")
+    logger.debug(f"Added {num_new} new token(s) to tokenizer")
     
     for token in COT_TOKENS:
         token_id = tokenizer.convert_tokens_to_ids(token)
@@ -218,6 +231,8 @@ def create_peft_config(model_args: ModelArguments, model_name: str) -> Optional[
     logger.info(f"LoRA target modules: {target_modules}")
     logger.info(f"LoRA configuration: r={model_args.lora_r}, alpha={model_args.lora_alpha}, dropout={model_args.lora_dropout}")
     
+    modules_to_save = ["embed_tokens", "lm_head", "wte", "wpe"]
+
     return LoraConfig(
         r=model_args.lora_r,
         lora_alpha=model_args.lora_alpha,
@@ -228,6 +243,7 @@ def create_peft_config(model_args: ModelArguments, model_name: str) -> Optional[
         inference_mode=model_args.lora_inference_mode,
         init_lora_weights=model_args.lora_init_lora_weights,
         fan_in_fan_out=model_args.lora_fan_in_fan_out,
+        modules_to_save=modules_to_save
     )
 
 def load_model(
@@ -263,13 +279,16 @@ def load_model(
             "load_in_4bit": True
         })
         logger.info("Loading model in 4-bit precision")
-    elif training_args.fp16 or training_args.bf16:
-        dtype = torch.float16 if training_args.fp16 else torch.bfloat16
-        load_kwargs["dtype"] = dtype
-        logger.info(f"Loading model with dtype: {dtype}")
+    elif training_args.bf16:
+        load_kwargs["dtype"] = torch.bfloat16
+        logger.info(f"Loading model with dtype: torch.bfloat16")
+    elif training_args.fp16:
+        logger.info("Loading model in fp32 for mixed-precision training")
+    else:
+        logger.info("Loading model in default precision (fp32)")
     
     try:
-        model = AutoCausalLM.from_pretrained(**load_kwargs)
+        model = CausalLM.from_pretrained(**load_kwargs)
         input_emb_size = model.get_input_embeddings().weight.size(0)
         tokenizer_vocab_size = len(tokenizer)
         model_vocab_size = model.config.vocab_size
@@ -307,6 +326,9 @@ def train_rl_mode(rl_mode: str, data_args: DataArguments, model_args: ModelArgum
 
     if data_args.num_train:
         config['num_train'] = data_args.num_train
+
+    if data_args.num_test:
+        config['num_test'] = data_args.num_test
     
     if model_args.model:
         config['common']['model'] = model_args.model
@@ -393,7 +415,6 @@ def train_rl_mode(rl_mode: str, data_args: DataArguments, model_args: ModelArgum
             logger.info("Results logged to WandB")
         
         return results
-        
     except Exception as e:
         logger.error(f"Error during RL training: {e}", exc_info=True)
         raise
@@ -401,7 +422,6 @@ def train_rl_mode(rl_mode: str, data_args: DataArguments, model_args: ModelArgum
         if wandb_run:
             wandb_run.finish()
             logger.info("WandB run finished")
-
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
@@ -470,10 +490,16 @@ def train():
     tokenizer = create_tokenizer(model_args.model, training_args.cache_dir)
     tokenizer.model_max_length = model_max_length
     logger.info(f"Tokenizer configured with max length: {model_max_length}")
-    cot_tokens = create_cot_tokens(model_args, tokenizer)
+    cot_tokens = create_cot_tokens(config, tokenizer)
     if cot_tokens:
         logger.info(f"Added {len(cot_tokens)} CoT tokens")
 
+    from transformers import AutoConfig
+    orig_config = AutoConfig.from_pretrained(model_args.model)
+    orig_vocab_size = orig_config.vocab_size
+    n_tokens_needed = max(len(cot_tokens), len(tokenizer) - orig_vocab_size)
+    logger.info(f"Model base vocab size: {orig_vocab_size}, tokenizer final size: {len(tokenizer)} -> need {n_tokens_needed} new tokens")
+    
     try:
         data_class = get_data_class(data_args.dataset)
         logger.debug(f"Using dataset class: {data_class.__name__}")
@@ -488,6 +514,13 @@ def train():
     try:
         train_dataset = data_class(data_args.dataset, "train", config=data_config)
         logger.info(f"Successfully loaded training dataset {data_args.dataset} with {len(train_dataset)} examples")
+        if data_args.num_train is not None:
+            limit = min(data_args.num_train, len(train_dataset))
+            train_dataset.x = train_dataset.x[:limit]
+            train_dataset.y = train_dataset.y[:limit]
+            if hasattr(train_dataset, 'data'):
+                train_dataset.data = train_dataset.data[:limit]
+            logger.info(f"Limited training dataset to {limit} examples (num_train={data_args.num_train})")
     except Exception as e:
         logger.error(f"Failed to load training dataset: {e}", exc_info=True)
         return
@@ -495,6 +528,13 @@ def train():
     try:
         eval_dataset = data_class(data_args.dataset, "test", config=data_config)
         logger.info(f"Evaluation dataset loaded successfully: {len(eval_dataset)} examples")
+        if data_args.num_test is not None:
+            limit = min(data_args.num_test, len(eval_dataset))
+            eval_dataset.x = eval_dataset.x[:limit]
+            eval_dataset.y = eval_dataset.y[:limit]
+            if hasattr(eval_dataset, 'data'):
+                eval_dataset.data = eval_dataset.data[:limit]
+            logger.info(f"Limited evaluation dataset to {limit} examples (num_test={data_args.num_test})")
     except Exception as e:
         logger.warning(f"No evaluation dataset: {e}")
         eval_dataset = None
@@ -505,7 +545,7 @@ def train():
                 tokenizer,
                 train_dataset,
                 eval_dataset,
-                max_num_eval=data_args.num_test
+                seed=config['common']['seed']
             )
             logger.info("Created supervised data module")
         elif data_args.mode == "fixed_length":
@@ -513,7 +553,8 @@ def train():
                 tokenizer,
                 train_dataset,
                 eval_dataset,
-                model_max_length
+                model_max_length,
+                seed=config['common']['seed']
             )
             logger.info("Created fixed length data module")
         else:
@@ -524,7 +565,7 @@ def train():
         return
     
     try:
-        model = load_model(model_args, training_args, len(cot_tokens), tokenizer)
+        model = load_model(model_args, training_args, n_tokens_needed, tokenizer)
         logger.info(f"Model loaded successfully: {model_args.model}")
     except Exception as e:
         logger.error(f"Failed to load model: {e}", exc_info=True)
@@ -534,16 +575,14 @@ def train():
         if 'lora' in model_args.parameter_efficient_mode:
             peft_config = create_peft_config(model_args, model_args.model)
             model = PeftModelForCausalLMWrapper(model, peft_config, add_tokens=True)
-            if "prompt-tuning" in model_args.parameter_efficient_mode:
-                enable_prompt_tuning(model.base_model.model)
-                logger.info("Applied LoRA + prompt tuning")
-            else:
-                logger.info("Applied LoRA")
-        elif 'prompt-tuning' in model_args.parameter_efficient_mode:
+            if "tag-tuning" in model_args.parameter_efficient_mode:
+                enable_tag_tuning(model.base_model.model)
+                logger.info("Applied tag tuning")
+        elif 'tag-tuning' in model_args.parameter_efficient_mode:
             for param in model.parameters():
                 param.requires_grad = False
-            enable_prompt_tuning(model)
-            logger.info("Applied prompt tuning")
+            enable_tag_tuning(model)
+            logger.info("Applied tag tuning")
     except Exception as e:
         logger.error(f"Failed to apply PEFT: {e}", exc_info=True)
         return

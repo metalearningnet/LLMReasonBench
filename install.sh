@@ -89,7 +89,7 @@ Model Installation:
   ./install.sh --model md --path /path/to/local/md  # Install from local directory
 
 Dataset Installation:
-  ./install.sh --dataset metalearningnet/qwen3-metamathqa-cot --name metamathqa
+  ./install.sh --dataset metalearningnet/qwen3-metamathqa-cot --name metamathqa --split test
 
 EOF
 }

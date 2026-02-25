@@ -46,9 +46,7 @@ class LMTrainer(Trainer):
             if self.is_deepspeed_enabled:
                 model = self.accelerator.prepare(model)
             else:
-                model = self.accelerator.prepare_model(
-                    model, evaluation_mode=True
-                )
+                model = self.accelerator.prepare_model(model, evaluation_mode=True)
 
             if self.is_fsdp_enabled:
                 self.model = model
@@ -60,12 +58,12 @@ class LMTrainer(Trainer):
             if self.args.fp16_full_eval:
                 model = model.to(
                     dtype=torch.float16,
-                    device=self.args.device,
+                    device=self.args.device
                 )
             elif self.args.bf16_full_eval:
                 model = model.to(
                     dtype=torch.bfloat16,
-                    device=self.args.device,
+                    device=self.args.device
                 )
 
         return model
@@ -104,7 +102,7 @@ class LMTrainer(Trainer):
             'do_sample': False,
             'temperature': 1.0,
             'pad_token_id': self.tokenizer.pad_token_id,
-            'eos_token_id': self.tokenizer.eos_token_id,
+            'eos_token_id': self.tokenizer.eos_token_id
         }
         
         with torch.no_grad():
@@ -187,7 +185,7 @@ class LMTrainer(Trainer):
         
         model = self._setup_model_for_evaluation(dataloader)
         
-        logger.info(f"***** Running {description} *****")
+        logger.info(f"Running {description}")
         if has_length(dataloader):
             logger.info(f"  Num examples = {self.num_examples(dataloader)}")
         else:
@@ -221,7 +219,6 @@ class LMTrainer(Trainer):
             
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
         
-        # Clean up past state after evaluation
         if args.past_index and hasattr(self, "_past"):
             delattr(self, "_past")
         

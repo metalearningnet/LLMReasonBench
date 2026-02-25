@@ -13,7 +13,7 @@ from transformers.models.llama.modeling_llama import LlamaModel, LlamaForCausalL
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
-    _prepare_4d_attention_mask,
+    _prepare_4d_attention_mask
 )
 
 class SparseGenerationMixin(GenerationMixin):
@@ -21,7 +21,7 @@ class SparseGenerationMixin(GenerationMixin):
         self,
         inputs_tensor: torch.Tensor,
         model_kwargs,
-        model_input_name: Optional[str] = None,
+        model_input_name: Optional[str] = None
     ) -> Dict[str, Any]:
         encoder = self.get_encoder()
 
@@ -306,7 +306,6 @@ class SparseLlamaForCausalLM(LlamaForCausalLM, SparseGenerationMixin):
         sparse_mask: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Union[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]:
-        # Forward through model with sparse_mask
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -599,7 +598,6 @@ class SparseGPT2LMHeadModel(GPT2LMHeadModel, SparseGenerationMixin):
         sparse_mask: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Union[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]:
-        # Forward through transformer with sparse_mask
         transformer_outputs = self.transformer(
             input_ids=input_ids,
             past_key_values=past_key_values,

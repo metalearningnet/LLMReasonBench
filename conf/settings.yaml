@@ -1,6 +1,6 @@
 common:
   model: "Qwen/Qwen3-1.7B"
-  parameter_efficient_mode: "lora+prompt-tuning"
+  parameter_efficient_mode: "lora-tag-tuning"
 
   dataset: "truthfulqa"                     # Default dataset
   hf_hub_token: ""                          # Hugging Face token
@@ -85,4 +85,4 @@ logging:
 experiment:
   name: "mem"
   notes: "Memory and Reasoning"
-  tags: ["lora", "prompt-tuning"]
+  tags: ["lora", "tag", "tuning"]

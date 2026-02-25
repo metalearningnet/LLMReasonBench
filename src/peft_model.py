@@ -22,8 +22,13 @@ from transformers import PreTrainedModel
 from peft.peft_model import PeftModel, PeftConfig, PeftModelForCausalLM
 
 class PeftModelWrapper(PeftModel):
-    def __init__(self, model: PreTrainedModel, peft_config: PeftConfig,
-                 adapter_name: str = "default", add_tokens=False):
+    def __init__(
+        self,
+        model: PreTrainedModel,
+        peft_config: PeftConfig,
+        adapter_name: str = "default",
+        add_tokens=False
+    ):
         super().__init__(model, peft_config, adapter_name)
         self.add_tokens = add_tokens
 
@@ -38,9 +43,14 @@ class PeftModelWrapper(PeftModel):
                                 selected_adapters, **kwargs)
 
         if self.add_tokens:
-            torch.save(self.base_model.model.get_input_embeddings().new_embedding,
+            input_emb = self.base_model.model.get_input_embeddings()
+            if hasattr(input_emb, 'new_embedding') and input_emb.new_embedding is not None:
+                torch.save(input_emb.new_embedding,
                         os.path.join(save_directory, "input_embeddings.pt"))
-            torch.save(self.base_model.model.get_output_embeddings().new_linear,
+            
+            output_emb = self.base_model.model.get_output_embeddings()
+            if hasattr(output_emb, 'new_linear') and output_emb.new_linear is not None:
+                torch.save(output_emb.new_linear,
                         os.path.join(save_directory, "output_embeddings.pt"))
 
 class PeftModelForCausalLMWrapper(PeftModelWrapper, PeftModelForCausalLM):

@@ -103,35 +103,15 @@ def make_fixed_length_data_module(
     tokenizer: transformers.PreTrainedTokenizer,
     dataset,
     eval_dataset,
-    seq_length
+    seq_length,
+    seed: int = 42
 ) -> Dict:
     logger.info("Creating fixed length data module")
     logger.info(f"Sequence length: {seq_length}")
     logger.info(f"Training dataset size: {len(dataset)}")
     logger.info(f"Evaluation dataset size: {len(eval_dataset) if eval_dataset else 0}")
     
-    random.seed(42)
-    
-    if eval_dataset is not None and len(eval_dataset) > 1000:
-        logger.info(f"Downsampling evaluation dataset from {len(eval_dataset)} to 1000 examples")
-        idx = random.choices(list(range(len(eval_dataset))), k=1000)
-        new_x = []
-        new_y = []
-        
-        for i in idx:
-            new_x.append(eval_dataset[i]['x'])
-            new_y.append(eval_dataset[i]['y'])
-        
-        eval_dataset.x = new_x
-        eval_dataset.y = new_y
-        logger.debug("Evaluation dataset downsampled successfully")
-    
-    if eval_dataset is not None:
-        if len(eval_dataset) > 1000:
-            error_msg = f"Evaluation dataset size ({len(eval_dataset)}) exceeds 1000"
-            logger.error(error_msg)
-            raise AssertionError(error_msg)
-        logger.info(f"Final evaluation dataset size: {len(eval_dataset)}")
+    random.seed(seed)
     
     logger.info("Creating training dataset")
     train_dataset = FixedLengthDataset(dataset, tokenizer, seq_length)

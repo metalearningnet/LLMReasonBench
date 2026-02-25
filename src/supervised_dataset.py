@@ -82,24 +82,9 @@ def make_supervised_data_module(
     tokenizer: transformers.PreTrainedTokenizer,
     dataset,
     eval_dataset: Optional[Dataset],
-    max_num_eval: Optional[int],
     seed: int = 42
 ) -> Dict:
     random.seed(seed)
-    
-    # Subsample evaluation dataset if needed
-    if eval_dataset is not None and max_num_eval is not None and len(eval_dataset) > max_num_eval:
-        indices = random.sample(range(len(eval_dataset)), max_num_eval)
-        
-        # Create a simple dataset-like object with x and y attributes
-        class SubsampledDataset:
-            def __init__(self, original_dataset, indices):
-                self.x = [original_dataset[i]['x'] for i in indices]
-                self.y = [original_dataset[i]['y'] for i in indices]
-            def __len__(self):
-                return len(self.x)
-        
-        eval_dataset = SubsampledDataset(eval_dataset, indices)
     
     train_dataset = SupervisedDataset(dataset, tokenizer)
     

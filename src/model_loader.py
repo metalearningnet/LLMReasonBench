@@ -72,16 +72,23 @@ class InputEmbedding(nn.Module):
         embedding_dim = self.original_embedding.weight.size(1)
         batch_size, seq_len = input_ids.shape
         
+        if original_token_mask.any():
+            target_dtype = original_embeddings.dtype
+        elif new_token_mask.any():
+            target_dtype = new_embeddings.dtype
+        else:
+            target_dtype = torch.float16
+        
         result = torch.zeros(
             (batch_size, seq_len, embedding_dim),
-            dtype=self.original_embedding.weight.dtype,
+            dtype=target_dtype,
             device=input_ids.device
         )
         
         if new_token_mask.any():
-            result[new_token_mask] = new_embeddings
+            result[new_token_mask] = new_embeddings.to(target_dtype)
         if original_token_mask.any():
-            result[original_token_mask] = original_embeddings
+            result[original_token_mask] = original_embeddings.to(target_dtype)
         
         return result
 
@@ -176,7 +183,7 @@ def load_embeddings(
             torch.storage._load_from_bytes,
             dict,
             list,
-            tuple,
+            tuple
         ]
         
         try:
@@ -223,11 +230,11 @@ def load_embeddings(
     n_loaded_tokens = input_weight.size(0)
     
     if n_loaded_tokens == n_tokens + orig_vocab_size:
-        logger.debug("Replacing entire input embedding layer with loaded weights")
+        logger.warning("Replacing entire input embedding layer with loaded weights")
         full_embedding = nn.Embedding.from_pretrained(input_weight)
         model.set_input_embeddings(full_embedding)
     elif n_loaded_tokens == n_tokens:
-        logger.debug(f"Adding {n_tokens} new tokens to existing input embeddings")
+        logger.warning(f"Adding {n_tokens} new tokens to existing input embeddings")
         current_embeddings = model.get_input_embeddings()
         
         if not isinstance(current_embeddings, InputEmbedding):
@@ -335,7 +342,7 @@ def _create_sparse_model(model_name: str, **kwargs) -> nn.Module:
         logger.error(error_msg)
         raise NotImplementedError(error_msg)
 
-class AutoCausalLM(AutoModelForCausalLM):
+class CausalLM(AutoModelForCausalLM):
     def __init__(
         self,
         n_tokens: int = 0,
@@ -358,11 +365,11 @@ class AutoCausalLM(AutoModelForCausalLM):
         parameter_efficient_mode: str = 'none',
         initialize_tokens: Optional[torch.Tensor] = None,
         **kwargs
-    ) -> 'AutoCausalLM':
-        if parameter_efficient_mode not in ['none', 'prompt-tuning', 'lora', 'lora+prompt-tuning']:
+    ) -> 'CausalLM':
+        if parameter_efficient_mode not in ["none", "lora", "lora-tag", "lora-tag-tuning"]:
             error_msg = (
                 f"Invalid parameter_efficient_mode: {parameter_efficient_mode}. "
-                "Valid options: none, prompt-tuning, lora, lora+prompt-tuning"
+                "Valid options: none, lora, lora-tag, lora-tag-tuning"
             )
             logger.error(error_msg)
             raise ValueError(error_msg)
@@ -393,8 +400,21 @@ class AutoCausalLM(AutoModelForCausalLM):
                 logger.debug(f"Using provided initialization tokens of shape: {initialize_tokens.shape}")
             
             if parameter_efficient_mode != 'none':
-                model.config.vocab_size = orig_vocab_size + n_tokens
-                logger.debug(f"Setting vocab size to: {model.config.vocab_size}")
+                new_vocab_size = orig_vocab_size + n_tokens
+                
+                if hasattr(model.config, "text_config"):
+                    logger.info(f"Updating text_config.vocab_size to {new_vocab_size}")
+                    model.config.text_config.vocab_size = new_vocab_size
+                
+                if not hasattr(model.config, "vocab_size") or model.config.vocab_size != new_vocab_size:
+                    logger.info(f"Forcing top-level vocab_size to {new_vocab_size}")
+                    setattr(model.config, "vocab_size", new_vocab_size)
+                
+                logger.debug(f"Setting vocab size to: {new_vocab_size}")
+
+                if hasattr(model, 'vocab_size'):
+                    model.vocab_size = new_vocab_size
+                    logger.debug(f"Set model.vocab_size to {new_vocab_size}")
                 
                 if input_embedding_file is not None:
                     logger.info("Loading embeddings from files")
@@ -457,14 +477,12 @@ def _save_pretrained_monkey_patch(
     os.makedirs(save_directory, exist_ok=True)
     logger.info(f"Saving model to: {save_directory}")
     
-    # Save input embeddings
     input_embeddings = self.get_input_embeddings()
     if hasattr(input_embeddings, 'new_embedding') and input_embeddings.new_embedding is not None:
         input_path = os.path.join(save_directory, "input_embeddings.pt")
         torch.save(input_embeddings.new_embedding.weight.data, input_path)
-        logger.debug(f"Saved input embedding weights (tensor) to: {input_path}")
+        logger.debug(f"Saved input embedding weights to: {input_path}")
     
-    # Save output embeddings
     output_embeddings = self.get_output_embeddings()
     if hasattr(output_embeddings, 'new_linear') and output_embeddings.new_linear is not None:
         output_path = os.path.join(save_directory, "output_embeddings.pt")
@@ -473,7 +491,7 @@ def _save_pretrained_monkey_patch(
             'bias': output_embeddings.new_linear.bias.data if output_embeddings.new_linear.bias is not None else None
         }
         torch.save(linear_state, output_path)
-        logger.debug(f"Saved output linear weights (dict) to: {output_path}")
+        logger.debug(f"Saved output linear weights to: {output_path}")
     
     original_save_pretrained = PreTrainedModel.save_pretrained.__wrapped__ if hasattr(PreTrainedModel.save_pretrained, '__wrapped__') else None
     if original_save_pretrained:

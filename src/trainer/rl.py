@@ -35,7 +35,7 @@ class RLTrainingArguments(transformers.TrainingArguments):
     
     dataset_name: str = field(default=None)
     dataset_split: str = field(default="train")
-    eval_split: str = field(default="validation")
+    eval_split: str = field(default=None)
     
     dpo_field_mappings: Optional[Dict[str, str]] = field(default=None)
     grpo_field_mappings: Optional[Dict[str, Any]] = field(default=None)
@@ -48,6 +48,7 @@ class RLTrainingArguments(transformers.TrainingArguments):
     ref_model_init_kwargs: Optional[Dict[str, Any]] = field(default_factory=dict)
     
     num_train: Optional[int] = field(default=None)
+    num_test: Optional[int] = field(default=None)
     checkpoint_dir: str = field(default=None)
 
 class RLConfigManager:
@@ -97,6 +98,7 @@ class RLConfigManager:
             "temperature": generator_config.get("temperature", 0.3),
             "top_p": generator_config.get("top_p", 1.0),
             "num_train": config.get("num_train", None),
+            "num_test": config.get("num_test", None),
             "seed": common_config.get("seed", 42),
             "training_mode": training_mode,
             "ref_model_init_kwargs": {},
@@ -113,7 +115,8 @@ class RLConfigManager:
                 "dpo_loss_type": dpo_config.get("loss_type", "sigmoid"),
                 "per_device_train_batch_size": max(1, common_config.get("batch_size", 1)),
                 "per_device_eval_batch_size": 1,
-                "dpo_field_mappings": field_mappings
+                "dpo_field_mappings": field_mappings,
+                "eval_split": dpo_config.get("eval_split", None)
             })
         elif training_mode == "grpo":
             grpo_config = rl_config.get("grpo", {})
@@ -150,7 +153,8 @@ class RLConfigManager:
                 "per_device_train_batch_size": batch_size,
                 "per_device_eval_batch_size": 1,
                 "grpo_field_mappings": field_mappings,
-                "num_rollouts": num_rollouts
+                "num_rollouts": num_rollouts,
+                "eval_split": grpo_config.get("eval_split", None)
             })
         
         return RLTrainingArguments(**args_dict)
@@ -232,7 +236,7 @@ class BaseRLTrainer:
         
         logger.info(f"Model saved to {output_dir}")
 
-def preprocess_dpo_dataset(dataset, rl_training_args, logger):
+def preprocess_dpo_dataset(dataset, rl_training_args, logger, limit=None):
     field_mappings = rl_training_args.dpo_field_mappings
     if field_mappings is None:
         raise ValueError("DPO field mappings must be provided")
@@ -284,10 +288,11 @@ def preprocess_dpo_dataset(dataset, rl_training_args, logger):
             f"Filtered out {initial_size - filtered_size} examples with empty or identical responses"
         )
     
-    if rl_training_args.num_train is not None and rl_training_args.num_train > 0:
-        limit = min(rl_training_args.num_train, len(dataset))
-        dataset = dataset.select(range(limit))
-        logger.info(f"Limited dataset to {limit} examples (requested: {rl_training_args.num_train})")
+    effective_limit = limit if limit is not None else rl_training_args.num_train
+    if effective_limit is not None and effective_limit > 0:
+        effective_limit = min(effective_limit, len(dataset))
+        dataset = dataset.select(range(effective_limit))
+        logger.info(f"Limited dataset to {effective_limit} examples")
     
     logger.info(f"Processed DPO dataset with {len(dataset)} examples")
     if len(dataset) > 0:
@@ -334,7 +339,8 @@ class RLDPOTrainer(BaseRLTrainer):
             ref_model=ref_model,
             args=dpo_config,
             train_dataset=self.train_dataset,
-            eval_dataset=self.eval_dataset
+            eval_dataset=self.eval_dataset,
+            processing_class=self.tokenizer
         )
         
         logger.info(f"RLDPOTrainer initialized with beta={self.args.beta}, loss_type={self.args.dpo_loss_type}")
@@ -369,7 +375,7 @@ def normalize_text(s: str) -> str:
 def calculate_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
-def preprocess_grpo_dataset(dataset, rl_training_args, logger):
+def preprocess_grpo_dataset(dataset, rl_training_args, logger, limit=None):
     field_mappings = rl_training_args.grpo_field_mappings
     answer_fields = field_mappings.get("answer_fields", {})
     score_fields = field_mappings.get("score_fields", {})
@@ -378,10 +384,8 @@ def preprocess_grpo_dataset(dataset, rl_training_args, logger):
     score_prefix = score_fields.get("prefix", "score_A")
     count = answer_fields.get("count", 4)
     
-    num_train_limit = getattr(rl_training_args, "num_train", None)
-    if num_train_limit is not None and num_train_limit > 0:
-        logger.info(f"Limiting dataset to first {num_train_limit} valid examples.")
-    
+    effective_limit = limit if limit is not None else rl_training_args.num_train
+
     processed = []
     dropped_zero_reward = 0
     dropped_empty = 0
@@ -389,8 +393,8 @@ def preprocess_grpo_dataset(dataset, rl_training_args, logger):
     logger.info("Starting GRPO dataset preprocessing...")
 
     for i, example in enumerate(dataset):
-        if num_train_limit is not None and len(processed) >= num_train_limit:
-            logger.info(f"Reached num_train limit ({num_train_limit}). Stopping preprocessing.")
+        if effective_limit is not None and len(processed) >= effective_limit:
+            logger.info(f"Reached limit ({effective_limit}). Stopping preprocessing.")
             break
 
         prompt = str(example.get("prompt", "")).strip()
@@ -500,7 +504,7 @@ class RLGRPOTrainer(BaseRLTrainer):
             beta=self.args.beta,
             seed=self.args.seed,
             logging_steps=self.args.logging_steps,
-            save_steps=self.args.save_steps,
+            save_steps=self.args.save_steps
         )
 
         self.trltrainer = GRPOTrainer(
@@ -585,7 +589,7 @@ def create_rl_trainer_from_config(
             lora_alpha=lora_config.get("alpha", 32),
             target_modules=lora_config.get("target_modules", ["q_proj", "v_proj"]),
             lora_dropout=lora_config.get("dropout", 0.1),
-            bias=lora_config.get("bias", "none") if training_mode != 'grpo' else "none",
+            bias=lora_config.get("bias", "none") if training_mode != "grpo" else "none",
             task_type=TaskType.CAUSAL_LM
         )
         model = get_peft_model(model, peft_config)
@@ -600,23 +604,43 @@ def create_rl_trainer_from_config(
         logger.info(f"Loading DPO dataset: {dataset_name}")
         dataset = load_dataset(dataset_name, split=rl_training_args.dataset_split)
         train_dataset = preprocess_dpo_dataset(dataset, rl_training_args, logger)
+
+        eval_dataset = None
+        if rl_training_args.eval_split:
+            try:
+                eval_dataset = load_dataset(dataset_name, split=rl_training_args.eval_split)
+                eval_dataset = preprocess_dpo_dataset(eval_dataset, rl_training_args, logger, limit=rl_training_args.num_test)
+                logger.info(f"Loaded evaluation dataset with {len(eval_dataset)} examples")
+            except Exception as e:
+                logger.warning(f"Could not load evaluation dataset: {e}")
         
         trainer = RLDPOTrainer(
             model=model,
             tokenizer=tokenizer,
             args=rl_training_args,
-            train_dataset=train_dataset
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset
         )
     elif training_mode == "grpo":
         logger.info(f"Loading GRPO dataset: {dataset_name}")
         dataset = load_dataset(dataset_name, split=rl_training_args.dataset_split)
         train_dataset = preprocess_grpo_dataset(dataset, rl_training_args, logger)
+
+        eval_dataset = None
+        if rl_training_args.eval_split:
+            try:
+                eval_dataset = load_dataset(dataset_name, split=rl_training_args.eval_split)
+                eval_dataset = preprocess_grpo_dataset(eval_dataset, rl_training_args, logger, limit=rl_training_args.num_test)
+                logger.info(f"Loaded evaluation dataset with {len(eval_dataset)} examples")
+            except Exception as e:
+                logger.warning(f"Could not load evaluation dataset: {e}")
         
         trainer = RLGRPOTrainer(
             model=model,
             tokenizer=tokenizer,
             args=rl_training_args,
-            train_dataset=train_dataset
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset
         )
     else:
         logger.error(f"Unsupported training mode {training_mode}")

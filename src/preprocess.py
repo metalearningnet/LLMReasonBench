@@ -57,7 +57,7 @@ class MultipleChoiceNormalizer(AnswerNormalizer):
             except ValueError:
                 pass
         
-        logger.warning(f"Could not normalize answer: '{answer}'")
+        logger.debug(f"Could not normalize answer: '{answer}'")
         return None
 
 class BooleanAnswerNormalizer(AnswerNormalizer):
@@ -111,7 +111,7 @@ class BooleanAnswerNormalizer(AnswerNormalizer):
                 logger.debug(f"First character '{first_char}' indicates false")
                 return 'false'
         
-        logger.warning(f"Could not normalize boolean answer: '{answer}'")
+        logger.debug(f"Could not normalize boolean answer: '{answer}'")
         return None
 
 class NumericAnswerNormalizer(AnswerNormalizer):
@@ -150,7 +150,7 @@ class NumericAnswerNormalizer(AnswerNormalizer):
             logger.debug(f"Extracted number: {result} from '{answer_str}'")
             return result
         
-        logger.warning(f"Could not find numeric value in: '{answer_str}'")
+        logger.debug(f"Could not find numeric value in: '{answer_str}'")
         return None
 
 class AnswerExtractor(ABC):
@@ -279,7 +279,7 @@ class BooleanAnswerExtractor(AnswerExtractor):
                 logger.debug(f"First character '{first_char}' indicates false")
                 return 'false'
         
-        logger.warning(f"Could not normalize boolean answer: '{completion}'")
+        logger.debug(f"Could not normalize boolean answer: '{completion}'")
         return self.invalid_ans
 
 class EnhancedNumericExtractor(AnswerExtractor):
@@ -328,7 +328,7 @@ class EnhancedNumericExtractor(AnswerExtractor):
             logger.debug(f"Using last number found in completion: {last_number}")
             return last_number
         
-        logger.warning(f"No numeric answer found in completion: '{completion[:100]}...'")
+        logger.debug(f"No numeric answer found in completion: '{completion[:100]}...'")
         return self.invalid_ans
     
     def _extract_numbers_from_text(self, text: str) -> List[str]:
@@ -519,7 +519,7 @@ class BaseData(Dataset, ABC):
         
         answer = self._normalizer.normalize(raw_answer)
         if answer is None:
-            logger.warning(f"Could not normalize answer: '{raw_answer[:50]}...'")
+            logger.debug(f"Could not normalize answer: '{raw_answer[:50]}...'")
             return None, None, None, None
         
         logger.debug(f"Normalized answer: '{raw_answer[:50]}...' -> '{answer}'")
@@ -626,7 +626,7 @@ class BaseData(Dataset, ABC):
         
         for idx, example in enumerate(self.data):
             if idx % 1000 == 0 and idx > 0:
-                logger.info(f"  Processed {idx}/{len(self.data)} examples...")
+                logger.debug(f"  Processed {idx}/{len(self.data)} examples...")
             
             inst, q, cot_steps, ans = self.parse_q_a(example)
             

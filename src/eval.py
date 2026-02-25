@@ -1,5 +1,7 @@
+import os
 import re
 import sys
+import yaml
 import json
 import torch
 import random
@@ -9,10 +11,10 @@ from tqdm import tqdm
 from pathlib import Path
 from datetime import datetime
 from dataset import DATASET_MAP
+from model_loader import CausalLM
 from huggingface_hub import login
 from preprocess import DataConfig
 from train import create_cot_tokens
-from model_loader import AutoCausalLM
 from peft import PeftModel, PeftConfig
 from torch.utils.data import DataLoader
 from dataclasses import dataclass, field, asdict
@@ -34,7 +36,6 @@ class ModelArguments:
         default=None,
         metadata={"help": "Path to the output directory."}
     )
-    use_cot: Optional[bool] = field(default=True)
     max_length: Optional[int] = field(default=1000)
     save_result: Optional[bool] = field(default=True)
     load_in_8bit: Optional[bool] = field(default=False)
@@ -52,7 +53,7 @@ class ModelArguments:
     do_sample: Optional[bool] = field(default=None)
     parameter_efficient_mode: Optional[str] = field(
         default='none',
-        metadata={"choices": ["none", "prompt-tuning", "lora", "lora+prompt-tuning"]}
+        metadata={"choices": ["none", "lora", "lora-tag", "lora-tag-tuning"]}
     )
     hf_hub_token: Optional[str] = field(
         default=None,
@@ -81,26 +82,64 @@ class TokenizerFactory:
     @staticmethod
     def create(model_name: str, cache_dir: Optional[str]) -> transformers.PreTrainedTokenizer:
         model_name_lower = model_name.lower()
-        
         if 'llama' in model_name_lower or 'alpaca' in model_name_lower:
             tokenizer_class = transformers.LlamaTokenizer
         else:
             tokenizer_class = transformers.AutoTokenizer
         
-        tokenizer = tokenizer_class.from_pretrained(
-            model_name,
-            cache_dir=cache_dir,
-            trust_remote_code=True
-        )
-        
+        if os.path.isdir(model_name):
+            try:
+                logger.info(f"Attempting to load tokenizer from local directory: {model_name}")
+                tokenizer = tokenizer_class.from_pretrained(
+                    model_name,
+                    cache_dir=cache_dir,
+                    trust_remote_code=True,
+                    local_files_only=True
+                )
+                logger.info("Successfully loaded tokenizer from local directory")
+                TokenizerFactory._post_process_tokenizer(tokenizer)
+                return tokenizer
+            except Exception as e:
+                logger.warning(f"Failed to load tokenizer from local directory: {e}")
+                logger.info("Attempting to load original model name from training config...")
+                
+                config_path = os.path.join(model_name, "training_config.yaml")
+                if os.path.isfile(config_path):
+                    with open(config_path, "r") as f:
+                        training_config = yaml.safe_load(f)
+                    original_model = training_config.get("common", {}).get("model")
+                    if original_model:
+                        logger.info(f"Found original model name: {original_model}")
+                        tokenizer = tokenizer_class.from_pretrained(
+                            original_model,
+                            cache_dir=cache_dir,
+                            trust_remote_code=True
+                        )
+                        TokenizerFactory._post_process_tokenizer(tokenizer)
+                        return tokenizer
+                    else:
+                        logger.error("No model name found in training_config.yaml")
+                else:
+                    logger.error(f"training_config.yaml not found in {model_name}")
+                
+                raise ValueError(f"Could not load tokenizer from '{model_name}'")
+        else:
+            logger.info(f"Loading tokenizer from Hugging Face hub: {model_name}")
+            tokenizer = tokenizer_class.from_pretrained(
+                model_name,
+                cache_dir=cache_dir,
+                trust_remote_code=True
+            )
+            TokenizerFactory._post_process_tokenizer(tokenizer)
+            return tokenizer
+
+    @staticmethod
+    def _post_process_tokenizer(tokenizer: transformers.PreTrainedTokenizer):
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             logger.debug(f"Set pad_token to eos_token: {tokenizer.pad_token}")
-        
         tokenizer.padding_side = "left"
         logger.debug(f"Set padding_side to: {tokenizer.padding_side}")
-        
-        return tokenizer
 
 class ModelPathResolver:
     @staticmethod
@@ -337,7 +376,7 @@ class ModelLoader:
                 load_kwargs["torch_dtype"] = torch.float32
                 logger.info("Loading base model with float32 precision")
             
-            model = AutoCausalLM.from_pretrained(**load_kwargs)
+            model = CausalLM.from_pretrained(**load_kwargs)
             logger.info("Base model loaded successfully")
             
             if checkpoint_dir and checkpoint_dir.exists():
@@ -457,9 +496,9 @@ class ModelLoader:
         
         try:
             try:
-                model = AutoCausalLM.from_pretrained(**load_kwargs)
+                model = CausalLM.from_pretrained(**load_kwargs)
             except:
-                logger.info("AutoCausalLM not available, using AutoModelForCausalLM")
+                logger.info("CausalLM not available, using AutoModelForCausalLM")
                 model = transformers.AutoModelForCausalLM.from_pretrained(**load_kwargs)
             
             logger.info(f"Base model loaded successfully: {model_name}")
@@ -520,7 +559,7 @@ class ModelLoader:
         logger.warning("Using legacy _load_base_model method")
         
         try:
-            model = AutoCausalLM.from_pretrained(**load_kwargs)
+            model = CausalLM.from_pretrained(**load_kwargs)
             logger.info(f"Base model loaded successfully")
             return model
         except Exception as e:
@@ -1351,9 +1390,6 @@ class ResultSaver:
         if hasattr(model_args, 'parameter_efficient_mode'):
             logger.info(f"Parameter efficient mode: {model_args.parameter_efficient_mode}")
         
-        if hasattr(model_args, 'use_cot'):
-            logger.info(f"CoT enabled: {model_args.use_cot}")
-        
         logger.info("=" * 60)
     
     @staticmethod
@@ -1437,7 +1473,7 @@ def evaluate() -> float:
     logger.info(f"Resolved model name: {model_name}")
     logger.info(f"Checkpoint directory: {checkpoint_dir}")
     
-    is_rl_trained_model = False
+    is_trl_trained_model = False
     
     if model_name in RESERVED_MODELS:
         logger.info(f"Loading reserved model: {model_name}")
@@ -1453,8 +1489,7 @@ def evaluate() -> float:
             )
             
             if has_training_args and has_adapter_config and has_adapter_model:
-                model_args.use_cot = False
-                is_rl_trained_model = True
+                is_trl_trained_model = True
                 logger.info("Detected RL-trained model (standard PEFT format)")
 
         tokenizer_path = str(checkpoint_dir) if checkpoint_dir and checkpoint_dir.exists() else model_name
@@ -1472,28 +1507,22 @@ def evaluate() -> float:
         
         cot_tokens = []
         num_new_tokens = 0
-        use_cot = getattr(model_args, 'use_cot', False)
-        if use_cot and not is_rl_trained_model:
-            logger.info("Creating CoT tokens for non-RL model")
+        if not is_trl_trained_model:
             try:
-                cot_tokens = create_cot_tokens(model_args, tokenizer)
-                num_new_tokens = len(cot_tokens)
+                cot_tokens = create_cot_tokens(config, tokenizer)
                 if cot_tokens:
-                    logger.info(f"Created {len(cot_tokens)} CoT indicator tokens")
+                    logger.info(f"Created {len(cot_tokens)} CoT delimiters")
+                
+                from transformers import AutoConfig
+                orig_config = AutoConfig.from_pretrained(model_name)
+                orig_vocab_size = orig_config.vocab_size
+                num_new_tokens = max(len(cot_tokens), len(tokenizer) - orig_vocab_size)
+                logger.info(f"Model base vocab size: {orig_vocab_size}, tokenizer final size: {len(tokenizer)} -> need {num_new_tokens} new tokens")
             except Exception as e:
-                logger.warning(f"Failed to create CoT tokens: {e}")
+                logger.warning(f"Failed to create CoT delimiters: {e}")
                 cot_tokens = []
-        elif use_cot and is_rl_trained_model:
-            logger.warning("CoT requested for RL-trained model - this is not recommended!")
-            try:
-                cot_tokens = create_cot_tokens(model_args, tokenizer)
-                num_new_tokens = len(cot_tokens)
-                if cot_tokens:
-                    logger.warning(f"Created {len(cot_tokens)} CoT tokens for RL-trained model (may not work)")
-            except Exception as e:
-                logger.error(f"Failed to create CoT tokens for RL model: {e}")
         else:
-            logger.info("CoT tokens disabled")
+            logger.info("CoT delimiters disabled")
         
         logger.info("Loading model...")
         model = ModelLoader.load(
@@ -1506,22 +1535,12 @@ def evaluate() -> float:
         )
         
         logger.info("=" * 60)
-        logger.info("MODEL INFORMATION")
+        logger.info("MODEL CONFIGURATION SUMMARY")
         logger.info("=" * 60)
-        logger.info(f"Model type: {type(model).__name__}")
-        logger.info(f"Is RL-trained model: {is_rl_trained_model}")
-        logger.info(f"CoT enabled: {use_cot}")
-        logger.info(f"Number of CoT tokens: {num_new_tokens}")
-        
-        try:
-            if isinstance(model, PeftModel):
-                logger.info("Model is a PEFT model with LoRA adapters")
-            else:
-                logger.info("Model is a standard (non-PEFT) model")
-        except ImportError:
-            logger.info("PEFT not available, model type unknown")
-        
-        logger.info(f"Model device: {next(model.parameters()).device}")
+        logger.info(f"PEFT Model Class: {type(model).__name__}")
+        logger.info(f"TRL Fine-tuning Status: {is_trl_trained_model}")
+        logger.info(f"Chain-of-Thought Delimiters: {num_new_tokens}")
+        logger.info(f"Active Device: {next(model.parameters()).device}")
         logger.info("=" * 60)
     
     model.eval()
@@ -1640,7 +1659,7 @@ def evaluate() -> float:
     
     final_accuracy = total_correct / total_examples if total_examples > 0 else 0
     
-    logger.info(f"Model type: {'RL-trained PEFT' if is_rl_trained_model else 'Standard model'}")
+    logger.info(f"Model type: {'TRL-trained PEFT' if is_trl_trained_model else 'Standard model'}")
     logger.info(f"Total examples evaluated: {total_examples}")
     logger.info(f"Correct predictions: {total_correct}")
     logger.info(f"Incorrect predictions: {total_examples - total_correct}")
@@ -1649,8 +1668,7 @@ def evaluate() -> float:
     if model_args.save_result:
         try:
             config['model_info'] = {
-                'is_rl_trained': is_rl_trained_model,
-                'use_cot': getattr(model_args, 'use_cot', False),
+                'is_trl_trained': is_trl_trained_model,
                 'model_type': type(model).__name__,
                 'checkpoint_dir': str(checkpoint_dir) if checkpoint_dir else None
             }
@@ -1683,11 +1701,6 @@ def evaluate_rl_checkpoint(checkpoint_path: str, dataset_name: str, **kwargs) ->
             args.extend(['--temperature', str(kwargs['temperature'])])
         if 'output_dir' in kwargs:
             args.extend(['--output_dir', kwargs['output_dir']])
-        
-        if kwargs.get('use_cot', False):
-            args.extend(['--use_cot', 'true'])
-        else:
-            args.extend(['--use_cot', 'false'])
         
         sys.argv = ['evaluate.py'] + args
         
