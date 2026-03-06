@@ -1,5 +1,5 @@
 common:
-  model: "Qwen/Qwen3-1.7B"
+  model: "Qwen/Qwen3.5-0.8B"
   parameter_efficient_mode: "lora-tag-tuning"
 
   dataset: "truthfulqa"                     # Default dataset
@@ -42,7 +42,7 @@ train:
   eval_steps: null                          # Evaluate every N steps
   save_steps: 0                             # Save checkpoint every N steps
   save_total_limit: 1                       # Keep only last N checkpoints
-  fp16: true                                # Use mixed precision training
+  fp16: true                                # FP16 mixed precision training
 
 generator:
   backend: "vllm"                           # 'api' | 'vllm'
@@ -74,7 +74,7 @@ generator:
     tensor_parallel_size: 1                 # Tensor parallelism (number of GPUs)
     gpu_memory_utilization: 0.8             # GPU memory utilization (0.0-1.0)
     use_chat_template: true                 # Whether to use chat template for formatting
-    model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    model: "Qwen/Qwen3.5-35B-A3B"
     system_message: "You are a helpful assistant."
 
 logging:

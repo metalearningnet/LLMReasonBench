@@ -34,6 +34,33 @@ log_success() { log "SUCCESS" "$GREEN"  "$1"; }
 log_warning() { log "WARNING" "$YELLOW" "$1"; }
 log_error()   { log "ERROR"   "$RED"    "$1"; exit 1; }
 
+ensure_uv_installed() {
+    if command -v uv &>/dev/null; then
+        return 0
+    fi
+
+    log_info "uv not found. Installing uv automatically..."
+
+    if command -v curl &>/dev/null; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+    elif command -v wget &>/dev/null; then
+        wget -qO- https://astral.sh/uv/install.sh | sh
+    else
+        log_error "Neither curl nor wget found. Please install curl or wget, or install uv manually: https://docs.astral.sh/uv/getting-started/installation/"
+    fi
+
+    local uv_path="$HOME/.local/bin"
+    if [[ -d "$uv_path" && ":$PATH:" != *":$uv_path:"* ]]; then
+        export PATH="$uv_path:$PATH"
+    fi
+
+    if ! command -v uv &>/dev/null; then
+        log_error "Failed to install uv. Please install manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    fi
+
+    log_info "uv installed successfully: $(uv --version)"
+}
+
 show_help() {
 cat <<EOF
 Usage: $0 [COMMAND] [OPTIONS]
@@ -41,7 +68,6 @@ Usage: $0 [COMMAND] [OPTIONS]
 Commands:
   --generate              Run dataset generation
   --train                 Run model training
-  --rl MODE               Run RL training (MODE: dpo | grpo)
   --eval                  Run evaluation
   --clean                 Remove generated outputs and caches
   -h, --help              Show this help message
@@ -70,10 +96,7 @@ Training Options:
   --dataset DATASET       Dataset for training
   --model MODEL           Base model or checkpoint path
   --num-train NUM         Number of training examples
-
-RL Training Options:
-  --rl MODE               RL training mode: dpo | grpo
-  --model MODEL           Base model path
+  --rl MODE               RL training mode: dpo | grpo (requires --train)
 
 Evaluation Options:
   --dataset DATASET       Dataset for evaluation
@@ -82,9 +105,9 @@ Evaluation Options:
 
 Examples:
   $0 --generate --dataset truthfulqa --mode train
-  $0 --train --dataset truthfulqa --model Qwen/Qwen3-1.7B
-  $0 --rl dpo --dataset truthfulqa --model Qwen/Qwen3-1.7B
-  $0 --rl grpo --dataset truthfulqa --model Qwen/Qwen3-1.7B
+  $0 --train --dataset truthfulqa --model Qwen/Qwen3.5-4B
+  $0 --train --rl dpo --dataset truthfulqa --model Qwen/Qwen3.5-4B
+  $0 --train --rl grpo --dataset truthfulqa --model Qwen/Qwen3.5-4B
   $0 --eval --dataset truthfulqa --model $CHECKPOINT_DIR
 
 EOF
@@ -92,7 +115,6 @@ EOF
 
 parse_args() {
     local args=()
-    local cuda_device=""
     
     while (( $# > 0 )); do
         case "$1" in
@@ -142,21 +164,7 @@ setup_directories() {
 }
 
 check_dependencies() {
-    local required_packages=("openai" "transformers" "yaml" "tqdm")
-    local missing=()
-    
-    for pkg in "${required_packages[@]}"; do
-        if ! python3 -c "import $pkg" 2>/dev/null; then
-            missing+=("$pkg")
-        fi
-    done
-    
-    if (( ${#missing[@]} > 0 )); then
-        log_warning "Missing Python packages: ${missing[*]}"
-        log_info "Install with: pip install ${missing[*]}"
-        return 1
-    fi
-    
+    log_info "Dependencies will be resolved automatically by uv at runtime"
     return 0
 }
 
@@ -170,16 +178,34 @@ validate_required_args() {
             [[ ! " ${args_ref[*]} " =~ "--dataset" ]] && missing+=("--dataset")
             [[ ! " ${args_ref[*]} " =~ "--mode" ]] && missing+=("--mode")
             ;;
+        --train)
+            [[ ! " ${args_ref[*]} " =~ "--model" ]] && missing+=("--model")
+            ;;
         --eval)
             [[ ! " ${args_ref[*]} " =~ "--model" ]] && missing+=("--model")
             ;;
     esac
     
     if (( ${#missing[@]} > 0 )); then
-        log_error "$command requires: ${missing[*]}"
-        log_info "Using defaults from config if available"
+        log_warning "$command missing recommended arguments: ${missing[*]}"
+        log_info "Will attempt to use defaults from config if available"
         return 1
     fi
+    
+    if [[ " ${args_ref[*]} " =~ "--rl" ]]; then
+        local rl_mode=""
+        for ((i=0; i<${#args_ref[@]}; i++)); do
+            if [[ "${args_ref[i]}" == "--rl" && $((i+1)) -lt ${#args_ref[@]} ]]; then
+                rl_mode="${args_ref[i+1]}"
+                break
+            fi
+        done
+        if [[ -n "$rl_mode" && "$rl_mode" != "dpo" && "$rl_mode" != "grpo" ]]; then
+            log_error "--rl mode must be 'dpo' or 'grpo', got: $rl_mode"
+            return 1
+        fi
+    fi
+    
     return 0
 }
 
@@ -214,10 +240,12 @@ run_command() {
         return 1
     fi
     
-    log_info "Starting $operation"
-    log_info "Running: python $python_script ${args[*]}"
+    ensure_uv_installed
     
-    if python "$python_script" "${args[@]}"; then
+    log_info "Starting $operation"
+    log_info "Running: uv run python $python_script ${args[*]}"
+    
+    if uv run python "$python_script" "${args[@]}"; then
         log_success "$operation completed successfully!"
         return 0
     else
@@ -240,6 +268,17 @@ show_summary() {
             local latest_checkpoint
             latest_checkpoint=$(find "$CHECKPOINT_DIR" -maxdepth 1 -type d -name "checkpoint-*" -printf "%T@ %p\n" 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
             [[ -n "$latest_checkpoint" ]] && log_info "Latest checkpoint: $(basename "$latest_checkpoint")"
+            
+            if [[ " ${args[*]} " =~ "--rl" ]]; then
+                local rl_mode=""
+                for ((i=0; i<${#args[@]}; i++)); do
+                    if [[ "${args[i]}" == "--rl" && $((i+1)) -lt ${#args[@]} ]]; then
+                        rl_mode="${args[i+1]}"
+                        break
+                    fi
+                done
+                [[ -n "$rl_mode" ]] && log_info "RL training mode: $rl_mode"
+            fi
             ;;
         --eval)
             local dataset=""
@@ -309,6 +348,12 @@ main() {
             exit 0
             ;;
         --generate|--train|--eval)
+            ensure_uv_installed
+            ;;
+        --rl)
+            log_error "--rl is not a standalone command. Use: $0 --train --rl <dpo|grpo> [other options]"
+            show_help
+            exit 1
             ;;
         *)
             log_error "Unknown command: $command"
@@ -319,15 +364,13 @@ main() {
     
     setup_directories
     check_config_file
-    if ! check_dependencies; then
-        log_warning "Some dependencies are missing. Execution may fail."
-    fi
+    check_dependencies
     
     local args_array
     mapfile -t args_array < <(parse_args "$@")
     
     if ! validate_required_args args_array "$command"; then
-        log_warning "Continuing with missing required arguments..."
+        log_warning "Continuing with missing required arguments (defaults will be used if available)..."
     fi
     
     if run_command "$command" "${args_array[@]}"; then

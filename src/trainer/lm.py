@@ -8,6 +8,10 @@ from transformers.trainer_pt_utils import IterableDatasetShard
 from transformers.trainer_utils import EvalLoopOutput, has_length
 
 class LMTrainer(Trainer):
+    def __init__(self, tokenizer=None, **kwargs):
+        super().__init__(**kwargs)
+        self.tokenizer = tokenizer
+    
     def get_eval_dataloader(
         self,
         eval_dataset: Optional[Dataset] = None

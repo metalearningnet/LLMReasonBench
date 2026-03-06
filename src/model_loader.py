@@ -24,8 +24,9 @@ class InputEmbedding(nn.Module):
         if n_new_tokens > 0:
             embedding_dim = original_embedding.weight.size(1)
             device = original_embedding.weight.device
+            target_dtype = original_embedding.weight.dtype
             
-            self.new_embedding = nn.Embedding(n_new_tokens, embedding_dim).to(device)
+            self.new_embedding = nn.Embedding(n_new_tokens, embedding_dim, dtype=target_dtype).to(device)
             
             if initialize_tokens is not None:
                 logger.debug(f"Initializing {n_new_tokens} new tokens from provided tokens")
@@ -106,8 +107,9 @@ class OutputEmbedding(nn.Module):
         if n_new_tokens > 0:
             hidden_dim = original_linear.weight.size(1)
             device = original_linear.weight.device
+            target_dtype = original_linear.weight.dtype
             
-            self.new_linear = nn.Linear(hidden_dim, n_new_tokens).to(device)
+            self.new_linear = nn.Linear(hidden_dim, n_new_tokens, dtype=target_dtype).to(device)
             
             if initialize_tokens is not None:
                 logger.debug(f"Initializing output layer for {n_new_tokens} new tokens from provided tokens")
@@ -228,10 +230,11 @@ def load_embeddings(
         raise ValueError(error_msg)
     
     n_loaded_tokens = input_weight.size(0)
+    target_dtype = model.get_input_embeddings().weight.dtype
     
     if n_loaded_tokens == n_tokens + orig_vocab_size:
         logger.warning("Replacing entire input embedding layer with loaded weights")
-        full_embedding = nn.Embedding.from_pretrained(input_weight)
+        full_embedding = nn.Embedding.from_pretrained(input_weight.to(target_dtype))
         model.set_input_embeddings(full_embedding)
     elif n_loaded_tokens == n_tokens:
         logger.warning(f"Adding {n_tokens} new tokens to existing input embeddings")
@@ -241,8 +244,8 @@ def load_embeddings(
             model.set_input_embeddings(InputEmbedding(current_embeddings, n_tokens))
         
         embedding_dim = input_weight.size(1)
-        new_embedding = nn.Embedding(n_tokens, embedding_dim)
-        new_embedding.weight.data.copy_(input_weight)
+        new_embedding = nn.Embedding(n_tokens, embedding_dim, dtype=target_dtype)
+        new_embedding.weight.data.copy_(input_weight.to(target_dtype))
         model.get_input_embeddings().new_embedding = new_embedding
     else:
         error_msg = (
@@ -260,6 +263,7 @@ def load_embeddings(
         
         output_weight = None
         output_bias = None
+        output_target_dtype = model.get_output_embeddings().weight.dtype
         
         if isinstance(output_data, dict) and 'weight' in output_data:
             output_weight = output_data['weight']
@@ -291,25 +295,23 @@ def load_embeddings(
         if n_loaded_output_tokens == n_tokens + orig_vocab_size:
             logger.debug("Replacing entire output embedding layer with loaded weights")
             hidden_dim = output_weight.size(1)
-            new_head = nn.Linear(hidden_dim, n_loaded_output_tokens)
-            new_head.weight.data.copy_(output_weight)
+            new_head = nn.Linear(hidden_dim, n_loaded_output_tokens, dtype=output_target_dtype)
+            new_head.weight.data.copy_(output_weight.to(output_target_dtype))
             if output_bias is not None:
-                new_head.bias.data.copy_(output_bias)
+                new_head.bias.data.copy_(output_bias.to(output_target_dtype) if torch.is_tensor(output_bias) else output_bias)
             model.set_output_embeddings(new_head)
         elif n_loaded_output_tokens == n_tokens:
             logger.debug(f"Adding {n_tokens} new tokens to existing output embeddings")
             current_head = model.get_output_embeddings()
             
-            # Wrap in OutputEmbedding if not already wrapped
             if not isinstance(current_head, OutputEmbedding):
                 model.set_output_embeddings(OutputEmbedding(current_head, n_tokens))
             
-            # Create new linear layer with loaded weights
             hidden_dim = output_weight.size(1)
-            new_linear = nn.Linear(hidden_dim, n_tokens)
-            new_linear.weight.data.copy_(output_weight)
+            new_linear = nn.Linear(hidden_dim, n_tokens, dtype=output_target_dtype)
+            new_linear.weight.data.copy_(output_weight.to(output_target_dtype))
             if output_bias is not None:
-                new_linear.bias.data.copy_(output_bias)
+                new_linear.bias.data.copy_(output_bias.to(output_target_dtype) if torch.is_tensor(output_bias) else output_bias)
             model.get_output_embeddings().new_linear = new_linear
         else:
             error_msg = (

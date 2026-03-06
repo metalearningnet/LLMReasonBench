@@ -283,6 +283,7 @@ def load_model(
         load_kwargs["dtype"] = torch.bfloat16
         logger.info(f"Loading model with dtype: torch.bfloat16")
     elif training_args.fp16:
+        load_kwargs["dtype"] = torch.float32
         logger.info("Loading model in fp32 for mixed-precision training")
     else:
         logger.info("Loading model in default precision (fp32)")
@@ -496,7 +497,13 @@ def train():
 
     from transformers import AutoConfig
     orig_config = AutoConfig.from_pretrained(model_args.model)
-    orig_vocab_size = orig_config.vocab_size
+    if hasattr(orig_config, "vocab_size"):
+        orig_vocab_size = orig_config.vocab_size
+    else:
+        logger.warning(f"'vocab_size' missing from config. Fetching from base tokenizer.")
+        temp_tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model, trust_remote_code=True)
+        orig_vocab_size = len(temp_tokenizer)
+        del temp_tokenizer
     n_tokens_needed = max(len(cot_tokens), len(tokenizer) - orig_vocab_size)
     logger.info(f"Model base vocab size: {orig_vocab_size}, tokenizer final size: {len(tokenizer)} -> need {n_tokens_needed} new tokens")
     
@@ -604,7 +611,7 @@ def train():
                     **config['train'],
                     'parameter_efficient_mode': model_args.parameter_efficient_mode,
                     'dataset': data_args.dataset,
-                    'model': model_args.model_path
+                    'model': model_args.model
                 }
             )
             logger.info("WandB initialized successfully")

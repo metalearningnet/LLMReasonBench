@@ -32,6 +32,33 @@ log_error() {
     exit 1
 }
 
+ensure_uv_installed() {
+    if command -v uv &>/dev/null; then
+        return 0
+    fi
+
+    log_info "uv not found. Installing uv automatically..."
+
+    if command -v curl &>/dev/null; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+    elif command -v wget &>/dev/null; then
+        wget -qO- https://astral.sh/uv/install.sh | sh
+    else
+        log_error "Neither curl nor wget found. Please install curl or wget, or install uv manually: https://docs.astral.sh/uv/getting-started/installation/"
+    fi
+
+    local uv_path="$HOME/.local/bin"
+    if [[ -d "$uv_path" && ":$PATH:" != *":$uv_path:"* ]]; then
+        export PATH="$uv_path:$PATH"
+    fi
+
+    if ! command -v uv &>/dev/null; then
+        log_error "Failed to install uv. Please install manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    fi
+
+    log_info "uv installed successfully: $(uv --version)"
+}
+
 INSTALL_PACKAGES=false
 INSTALL_MODEL=false
 INSTALL_DATASET=false
@@ -216,10 +243,15 @@ validate_arguments() {
 }
 
 install_packages() {
-    log_info "Installing Python packages..."
+    log_info "Installing Python packages with uv..."
 
-    package_list=(
-        vllm absl-py accelerate aiohappyeyeballs aiohttp aiosignal
+    if [[ -z "${VIRTUAL_ENV:-}" ]] && [[ ! -d ".venv" ]]; then
+        log_info "No virtual environment found. Creating one with 'uv venv'..."
+        uv venv
+    fi
+
+    local package_list=(
+        absl-py accelerate aiohappyeyeballs aiohttp aiosignal
         altair annotated-types anyio asttokens async-timeout
         attrs bitsandbytes blessed blinker cachetools
         certifi chanfig charset-normalizer click coloredlogs
@@ -245,19 +277,26 @@ install_packages() {
         six smmap sniffio stack-data streamlit
         StrEnum sympy tenacity tensorboard tensorboard-data-server
         threadpoolctl tokenizers toml torch torchaudio
-        torchvision tornado tqdm traitlets transformers
+        torchvision tornado tqdm traitlets
         triton typing_extensions tzdata urllib3 wandb
         watchdog wcwidth Werkzeug xxhash yarl zipp
     )
 
-    log_info "Upgrading pip..."
-    pip install --upgrade pip
+    log_info "Installing vLLM nightly build..."
+    export UV_TORCH_BACKEND=auto
+    uv pip install -U vllm --extra-index-url https://wheels.vllm.ai/nightly || log_warning "vLLM installation failed"
 
-    log_info "Installing ${#package_list[@]} packages..."
-    if pip install "${package_list[@]}"; then
+    log_info "Installing ${#package_list[@]} additional packages..."
+    if uv pip install "${package_list[@]}"; then
         log_info "All packages installed successfully"
     else
         log_error "Failed to install packages"
+    fi
+
+    if uv pip install -U transformers; then
+        log_success "Transformers is up to date"
+    else
+        log_warning "Failed to upgrade Transformers"
     fi
 }
 
@@ -329,9 +368,9 @@ install_dataset() {
     [[ "$DATASET_SHUFFLE" == true ]] && CMD_ARGS+=("--shuffle")
     [[ "$DATASET_STREAMING" == true ]] && CMD_ARGS+=("--streaming")
 
-    log_info "Executing: python $DATASET_LOADER_SCRIPT ${CMD_ARGS[*]}"
+    log_info "Executing: uv run python $DATASET_LOADER_SCRIPT ${CMD_ARGS[*]}"
 
-    if python "$DATASET_LOADER_SCRIPT" "${CMD_ARGS[@]}"; then
+    if uv run python "$DATASET_LOADER_SCRIPT" "${CMD_ARGS[@]}"; then
         local OUTPUT_FILE="${DATASET_OUTPUT_DIR}/${DATASET_NAME}_${DATASET_SPLIT}.json"
         if [[ ! -f "$OUTPUT_FILE" ]]; then
             log_warning "Dataset download completed but output file not found."
@@ -343,8 +382,8 @@ install_dataset() {
 }
 
 main() {
+    ensure_uv_installed
     parse_arguments "$@"
-
     validate_arguments
 
     if [[ "$INSTALL_PACKAGES" == true ]]; then
