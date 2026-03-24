@@ -39,19 +39,21 @@ class PeftModelWrapper(PeftModel):
         selected_adapters: Optional[List[str]] = None,
         **kwargs: Any
     ):
-        super().save_pretrained(save_directory, safe_serialization,
-                                selected_adapters, **kwargs)
+        super().save_pretrained(
+            save_directory,
+            safe_serialization,
+            selected_adapters,
+            **kwargs
+        )
 
         if self.add_tokens:
             input_emb = self.base_model.model.get_input_embeddings()
             if hasattr(input_emb, 'new_embedding') and input_emb.new_embedding is not None:
-                torch.save(input_emb.new_embedding,
-                        os.path.join(save_directory, "input_embeddings.pt"))
+                torch.save(input_emb.new_embedding, os.path.join(save_directory, "input_embeddings.pt"))
             
             output_emb = self.base_model.model.get_output_embeddings()
             if hasattr(output_emb, 'new_linear') and output_emb.new_linear is not None:
-                torch.save(output_emb.new_linear,
-                        os.path.join(save_directory, "output_embeddings.pt"))
+                torch.save(output_emb.new_linear, os.path.join(save_directory, "output_embeddings.pt"))
 
 class PeftModelForCausalLMWrapper(PeftModelWrapper, PeftModelForCausalLM):
     def __init__(self, model, peft_config: PeftConfig, adapter_name="default", add_tokens=False):

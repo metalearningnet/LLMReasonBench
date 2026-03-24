@@ -124,7 +124,7 @@ def main():
         "--dataset",
         type=str,
         required=True,
-        help="Path of the dataset on Hugging Face Hub (e.g., 'metalearningnet/qwen3-metamathqa-cot')"
+        help="Path of the dataset on Hugging Face Hub (e.g., 'metalearningnet/qwen3.5-metamathqa-cot')"
     )
     
     parser.add_argument(

@@ -1,8 +1,14 @@
 #!/bin/bash
+set -euo pipefail
+
+OS=$(uname -s)
+
+UV_INSTALL_METHOD=${UV_INSTALL_METHOD:-standalone}
+UV_PYTHON_VERSION=${UV_PYTHON_VERSION:-3.12}
 
 readonly DATASET_LOADER_SCRIPT="src/dataset_loader.py"
-readonly DEFAULT_OUTPUT_DIR="data"
 readonly MD_TARGET_DIR="./targets/md"
+readonly DEFAULT_OUTPUT_DIR="data"
 
 if [[ -t 1 ]]; then
     readonly BOLD=$(tput bold 2>/dev/null || echo)
@@ -32,31 +38,90 @@ log_error() {
     exit 1
 }
 
+check_os_support() {
+    case "$OS" in
+        Linux|Darwin)
+            return 0
+            ;;
+        *)
+            log_error "Unsupported operating system: $OS. This script only supports Linux and macOS."
+            ;;
+    esac
+}
+
+add_common_uv_paths() {
+    case "$OS" in
+        Linux)
+            if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+                export PATH="$HOME/.local/bin:$PATH"
+            fi
+            ;;
+        Darwin)
+            if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+                export PATH="$HOME/.local/bin:$PATH"
+            fi
+            for p in "$HOME/Library/Python/3."*"/bin"; do
+                if [[ -d "$p" && ":$PATH:" != *":$p:"* ]]; then
+                    export PATH="$p:$PATH"
+                fi
+            done
+            ;;
+    esac
+}
+
 ensure_uv_installed() {
+    add_common_uv_paths
+
     if command -v uv &>/dev/null; then
         return 0
     fi
 
-    log_info "uv not found. Installing uv automatically..."
+    log_info "uv not found. Installing uv automatically ($UV_INSTALL_METHOD)..."
 
-    if command -v curl &>/dev/null; then
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-    elif command -v wget &>/dev/null; then
-        wget -qO- https://astral.sh/uv/install.sh | sh
+    if [[ "$UV_INSTALL_METHOD" == "pip" ]]; then
+        log_info "Installing uv with pip..."
+        if ! command -v python3 &>/dev/null; then
+            log_error "python3 not found, cannot install uv via pip."
+        fi
+
+        python3 -m pip --version &>/dev/null || log_error "pip not available for python3"
+
+        python3 -m pip install --user uv || log_error "pip install uv failed"
+
+        add_common_uv_paths
+
+        if ! command -v uv &>/dev/null; then
+            log_error "uv installed via pip but 'uv' command not found in PATH. Tried adding common directories. Please add the appropriate Python script directory to your PATH manually."
+        fi
+        log_info "uv installed via pip successfully: $(uv --version)"
     else
-        log_error "Neither curl nor wget found. Please install curl or wget, or install uv manually: https://docs.astral.sh/uv/getting-started/installation/"
+        if command -v curl &>/dev/null; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+        elif command -v wget &>/dev/null; then
+            wget -qO- https://astral.sh/uv/install.sh | sh
+        else
+            log_error "Neither curl nor wget found. Please install curl or wget, or install uv manually: https://docs.astral.sh/uv/getting-started/installation/"
+        fi
+
+        add_common_uv_paths
+
+        if ! command -v uv &>/dev/null; then
+            log_error "Failed to install uv. Please install manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
+        fi
+
+        log_info "uv installed successfully: $(uv --version)"
+    fi
+}
+
+setup_venv() {
+    if [[ ! -d ".venv" ]]; then
+        log_info "Creating virtual environment with uv (Python $UV_PYTHON_VERSION)..."
+        uv venv --python "$UV_PYTHON_VERSION" --seed || \
+            log_error "Failed to create virtual environment. Ensure Python $UV_PYTHON_VERSION is available (try: uv python install $UV_PYTHON_VERSION)"
     fi
 
-    local uv_path="$HOME/.local/bin"
-    if [[ -d "$uv_path" && ":$PATH:" != *":$uv_path:"* ]]; then
-        export PATH="$uv_path:$PATH"
-    fi
-
-    if ! command -v uv &>/dev/null; then
-        log_error "Failed to install uv. Please install manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
-    fi
-
-    log_info "uv installed successfully: $(uv --version)"
+    source .venv/bin/activate || log_error "Failed to activate virtual environment"
+    log_info "Virtual environment ready: .venv (Python: $(python --version 2>&1))"
 }
 
 INSTALL_PACKAGES=false
@@ -91,7 +156,7 @@ Model Installation:
 
 Dataset Installation:
   --dataset DATASET            [Required] Hugging Face dataset identifier
-                               Example: 'metalearningnet/qwen3-metamathqa-cot'
+                               Example: 'metalearningnet/qwen3.5-metamathqa-cot'
 
   --config CONFIG              Configuration name for multi-configuration datasets
 
@@ -116,7 +181,11 @@ Model Installation:
   ./install.sh --model md --path /path/to/local/md  # Install from local directory
 
 Dataset Installation:
-  ./install.sh --dataset metalearningnet/qwen3-metamathqa-cot --name metamathqa --split test
+  ./install.sh --dataset metalearningnet/qwen3.5-metamathqa-cot --name metamathqa --split test
+
+Environment Variables:
+  UV_INSTALL_METHOD            How to install uv if missing: "standalone" (default) or "pip"
+  UV_PYTHON_VERSION            Python version for virtual environment (default: 3.12)
 
 EOF
 }
@@ -243,12 +312,9 @@ validate_arguments() {
 }
 
 install_packages() {
-    log_info "Installing Python packages with uv..."
+    setup_venv
 
-    if [[ -z "${VIRTUAL_ENV:-}" ]] && [[ ! -d ".venv" ]]; then
-        log_info "No virtual environment found. Creating one with 'uv venv'..."
-        uv venv
-    fi
+    log_info "Installing Python packages with uv..."
 
     local package_list=(
         absl-py accelerate aiohappyeyeballs aiohttp aiosignal
@@ -279,7 +345,7 @@ install_packages() {
         threadpoolctl tokenizers toml torch torchaudio
         torchvision tornado tqdm traitlets
         triton typing_extensions tzdata urllib3 wandb
-        watchdog wcwidth Werkzeug xxhash yarl zipp
+        watchdog wcwidth Werkzeug xxhash yarl zipp trl
     )
 
     log_info "Installing vLLM nightly build..."
@@ -294,13 +360,15 @@ install_packages() {
     fi
 
     if uv pip install -U transformers; then
-        log_success "Transformers is up to date"
+        log_info "Transformers is up to date"
     else
         log_warning "Failed to upgrade Transformers"
     fi
 }
 
 install_model() {
+    setup_venv
+
     log_info "Installing $MODEL_NAME model..."
 
     if [[ "$MODEL_NAME" != "md" ]]; then
@@ -338,6 +406,8 @@ install_model() {
 }
 
 install_dataset() {
+    setup_venv
+
     log_info "Downloading dataset..."
 
     if [[ ! -f "$DATASET_LOADER_SCRIPT" ]]; then
@@ -382,6 +452,8 @@ install_dataset() {
 }
 
 main() {
+    check_os_support
+
     ensure_uv_installed
     parse_arguments "$@"
     validate_arguments

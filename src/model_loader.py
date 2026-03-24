@@ -368,10 +368,10 @@ class CausalLM(AutoModelForCausalLM):
         initialize_tokens: Optional[torch.Tensor] = None,
         **kwargs
     ) -> 'CausalLM':
-        if parameter_efficient_mode not in ["none", "lora", "lora-tag", "lora-tag-tuning"]:
+        if parameter_efficient_mode not in ["none", "lora", "lora-cog-frozen", "lora-cog-tuned"]:
             error_msg = (
                 f"Invalid parameter_efficient_mode: {parameter_efficient_mode}. "
-                "Valid options: none, lora, lora-tag, lora-tag-tuning"
+                "Valid options: none, lora, lora-cog-frozen, lora-cog-tuned"
             )
             logger.error(error_msg)
             raise ValueError(error_msg)

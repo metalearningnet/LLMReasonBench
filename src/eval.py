@@ -53,7 +53,7 @@ class ModelArguments:
     do_sample: Optional[bool] = field(default=None)
     parameter_efficient_mode: Optional[str] = field(
         default='none',
-        metadata={"choices": ["none", "lora", "lora-tag", "lora-tag-tuning"]}
+        metadata={"choices": ["none", "lora", "lora-cog-frozen", "lora-cog-tuned"]}
     )
     hf_hub_token: Optional[str] = field(
         default=None,

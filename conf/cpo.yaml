@@ -1,0 +1,9 @@
+dataset: "metalearningnet/qwen3.5-metamathqa"
+dataset_format: "preference_pairs"
+loss_type: "sigmoid"
+field_mappings:
+  prompt: "prompt"
+  chosen: "chosen"
+  rejected: "rejected"
+beta: 0.1
+cpo_alpha: 1.0

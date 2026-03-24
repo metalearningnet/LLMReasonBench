@@ -8,27 +8,6 @@ from .truthfulqa import TruthfulQAGenerator, TruthfulQA
 from .metamathqa import MetaMathQAGenerator, MetaMathQA
 from .commonsenseqa import CommonsenseQAGenerator, CommonsenseQA
 
-__all__ = [
-    'AquaGenerator',
-    'GSM8KGenerator',
-    'AIME24Generator',
-    'AIME25Generator',
-    'MMLUProGenerator',
-    'TruthfulQAGenerator',
-    'MetaMathQAGenerator',
-    'StrategyQAGenerator',
-    'CommonsenseQAGenerator',
-    'Aqua',
-    'GSM8K',
-    'AIME24',
-    'AIME25',
-    'MMLUPro',
-    'TruthfulQA',
-    'MetaMathQA',
-    'StrategyQA',
-    'CommonsenseQA'
-]
-
 GENERATOR_MAP = {
     'aqua': AquaGenerator,
     'gsm8k': GSM8KGenerator,

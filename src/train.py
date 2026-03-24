@@ -3,8 +3,8 @@ import torch
 import shutil
 import transformers
 from pathlib import Path
+from trainer import LMTrainer
 from dataset import DATASET_MAP
-from trainer.lm import LMTrainer
 from preprocess import DataConfig
 from huggingface_hub import login
 from model_loader import CausalLM
@@ -17,7 +17,7 @@ from transformers.utils import logging as transformers_logging
 from peft import LoraConfig, TaskType, prepare_model_for_kbit_training
 from config import (
     COT_TOKENS, DEFAULT_TRAIN_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR,
-    load_config, load_datasets_config, load_rl_config, update_dataclass_from_config,
+    load_config, load_datasets_config, update_dataclass_from_config,
     setup_directories, logger, dataset_names
 )
 
@@ -42,7 +42,7 @@ class ModelArguments:
     hf_hub_token: Optional[str] = field(default="none")
     parameter_efficient_mode: Optional[str] = field(
         default="none",
-        metadata={"choices": ["none", "lora", "lora-tag", "lora-tag-tuning"]}
+        metadata={"choices": ["none", "lora", "lora-cog-frozen", "lora-cog-tuned"]}
     )
     use_calculator: Optional[bool] = field(default=False)
     lora_module: Optional[str] = field(default="mlp")
@@ -89,7 +89,7 @@ class TrainingArguments(transformers.TrainingArguments):
     eval_steps: Optional[int] = field(default=50)
     save_steps: Optional[int] = field(default=100)
     save_total_limit: Optional[int] = field(default=1)
-    fp16: Optional[bool] = field(default=True)
+    fp16: Optional[bool] = field(default=False)
     bf16: Optional[bool] = field(default=False)
     output_dir: str = field(default=str(DEFAULT_TRAIN_OUTPUT_DIR))
     checkpoint_dir: str = field(default=str(DEFAULT_CHECKPOINT_DIR))
@@ -111,7 +111,7 @@ def log_trainable_parameters(model: torch.nn.Module):
     
     return trainable_params, all_param, trainable_percent
 
-def enable_tag_tuning(model: torch.nn.Module):
+def enable_cog_tuning(model: torch.nn.Module):
     input_emb = model.get_input_embeddings()
     output_emb = model.get_output_embeddings()
     
@@ -318,13 +318,10 @@ def train_rl_mode(rl_mode: str, data_args: DataArguments, model_args: ModelArgum
     logger.info(f"Starting RL training mode: {rl_mode}")
     
     base_config = load_config()
-    rl_config = load_rl_config()
     config = base_config.copy()
-    
-    config['rl'] = rl_config
     config['rl']['training_mode'] = rl_mode
     config['common']['dataset'] = data_args.dataset
-
+    
     if data_args.num_train:
         config['num_train'] = data_args.num_train
 
@@ -402,9 +399,9 @@ def train_rl_mode(rl_mode: str, data_args: DataArguments, model_args: ModelArgum
             logger.warning(f"Failed to initialize WandB: {e}")
     
     try:
-        from trainer.rl import create_rl_trainer_from_config
+        from trainer import create_rl_trainer
         
-        trainer = create_rl_trainer_from_config(config=config)
+        trainer = create_rl_trainer(config)
         
         logger.info(f"Starting {rl_mode.upper()} training...")
         results = trainer.train()
@@ -427,14 +424,14 @@ def train_rl_mode(rl_mode: str, data_args: DataArguments, model_args: ModelArgum
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args, remaining_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
-    
+    config = load_config()
     rl_mode = None
     if "--rl" in remaining_args:
         rl_index = remaining_args.index("--rl")
         if rl_index + 1 < len(remaining_args) and not remaining_args[rl_index + 1].startswith("--"):
             rl_mode = remaining_args[rl_index + 1]
         else:
-            rl_mode = "dpo"
+            rl_mode = config['rl']['training_mode']
 
     checkpoint_dir = Path(training_args.checkpoint_dir)
     if checkpoint_dir.exists():
@@ -449,7 +446,7 @@ def train():
             training_args=training_args
         )
     
-    config = load_config()
+    
     if not data_args.dataset:
         data_args.dataset = config['common']['dataset']
     
@@ -579,17 +576,25 @@ def train():
         return
     
     try:
+        peft_mode = model_args.parameter_efficient_mode
         if 'lora' in model_args.parameter_efficient_mode:
             peft_config = create_peft_config(model_args, model_args.model)
-            model = PeftModelForCausalLMWrapper(model, peft_config, add_tokens=True)
-            if "tag-tuning" in model_args.parameter_efficient_mode:
-                enable_tag_tuning(model.base_model.model)
-                logger.info("Applied tag tuning")
-        elif 'tag-tuning' in model_args.parameter_efficient_mode:
+            add_tokens = 'cog' in peft_mode
+            model = PeftModelForCausalLMWrapper(model, peft_config, add_tokens=add_tokens)
+            logger.info(f"Applied LoRA PEFT wrapper (add_tokens={add_tokens})")
+        else:
             for param in model.parameters():
                 param.requires_grad = False
-            enable_tag_tuning(model)
-            logger.info("Applied tag tuning")
+            logger.info("LoRA is not enabled; froze all base model parameters")
+        
+        if 'cog-tuned' in peft_mode:
+            enable_cog_tuning(model)
+            logger.info("Applied cognitive token tuning")
+        elif 'cog-frozen' in peft_mode:
+            logger.info("Cognitive token tuning disabled")
+        elif 'cog' in peft_mode:
+            logger.error(f"Invalid peft mode: '{peft_mode}'. Must specify 'cog-tuned' or 'cog-frozen'.")
+            return
     except Exception as e:
         logger.error(f"Failed to apply PEFT: {e}", exc_info=True)
         return

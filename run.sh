@@ -1,12 +1,14 @@
 #!/bin/bash
-
 set -euo pipefail
+
+OS=$(uname -s)
 
 readonly OUTPUT_DIR="./output"
 readonly CHECKPOINT_DIR="$OUTPUT_DIR/checkpoint"
 readonly EVAL_OUTPUT_DIR="$OUTPUT_DIR/eval"
 readonly CONFIG_FILE="conf/settings.yaml"
 readonly TARGETS_DIR="./targets"
+readonly VENV_DIR="./.venv"
 readonly CONF_DIR="./conf"
 readonly DATA_DIR="./data"
 readonly LOG_DIR="./wandb"
@@ -34,7 +36,40 @@ log_success() { log "SUCCESS" "$GREEN"  "$1"; }
 log_warning() { log "WARNING" "$YELLOW" "$1"; }
 log_error()   { log "ERROR"   "$RED"    "$1"; exit 1; }
 
+check_os_support() {
+    case "$OS" in
+        Linux|Darwin)
+            return 0
+            ;;
+        *)
+            log_error "Unsupported operating system: $OS. This script only supports Linux and macOS."
+            ;;
+    esac
+}
+
+add_common_uv_paths() {
+    case "$OS" in
+        Linux)
+            if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+                export PATH="$HOME/.local/bin:$PATH"
+            fi
+            ;;
+        Darwin)
+            if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+                export PATH="$HOME/.local/bin:$PATH"
+            fi
+            for p in "$HOME/Library/Python/3."*"/bin"; do
+                if [[ -d "$p" && ":$PATH:" != *":$p:"* ]]; then
+                    export PATH="$p:$PATH"
+                fi
+            done
+            ;;
+    esac
+}
+
 ensure_uv_installed() {
+    add_common_uv_paths
+
     if command -v uv &>/dev/null; then
         return 0
     fi
@@ -49,10 +84,7 @@ ensure_uv_installed() {
         log_error "Neither curl nor wget found. Please install curl or wget, or install uv manually: https://docs.astral.sh/uv/getting-started/installation/"
     fi
 
-    local uv_path="$HOME/.local/bin"
-    if [[ -d "$uv_path" && ":$PATH:" != *":$uv_path:"* ]]; then
-        export PATH="$uv_path:$PATH"
-    fi
+    add_common_uv_paths
 
     if ! command -v uv &>/dev/null; then
         log_error "Failed to install uv. Please install manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
@@ -96,7 +128,7 @@ Training Options:
   --dataset DATASET       Dataset for training
   --model MODEL           Base model or checkpoint path
   --num-train NUM         Number of training examples
-  --rl MODE               RL training mode: dpo | grpo (requires --train)
+  --rl MODE               RL training mode: dpo | cpo | kto | orpo (requires --train)
 
 Evaluation Options:
   --dataset DATASET       Dataset for evaluation
@@ -105,9 +137,8 @@ Evaluation Options:
 
 Examples:
   $0 --generate --dataset truthfulqa --mode train
-  $0 --train --dataset truthfulqa --model Qwen/Qwen3.5-4B
-  $0 --train --rl dpo --dataset truthfulqa --model Qwen/Qwen3.5-4B
-  $0 --train --rl grpo --dataset truthfulqa --model Qwen/Qwen3.5-4B
+  $0 --train --dataset truthfulqa --model Qwen/Qwen3.5-9B
+  $0 --train --rl dpo --dataset truthfulqa --model Qwen/Qwen3.5-9B
   $0 --eval --dataset truthfulqa --model $CHECKPOINT_DIR
 
 EOF
@@ -200,8 +231,8 @@ validate_required_args() {
                 break
             fi
         done
-        if [[ -n "$rl_mode" && "$rl_mode" != "dpo" && "$rl_mode" != "grpo" ]]; then
-            log_error "--rl mode must be 'dpo' or 'grpo', got: $rl_mode"
+        if [[ -n "$rl_mode" && "$rl_mode" != "dpo" && "$rl_mode" != "cpo" && "$rl_mode" != "kto" && "$rl_mode" != "orpo" ]]; then
+            log_error "--rl mode must be 'dpo', 'cpo', 'kto', or 'orpo', got: $rl_mode"
             return 1
         fi
     fi
@@ -311,9 +342,9 @@ show_summary() {
 }
 
 clean() {
-    log_info "Cleaning output and data directories..."
+    log_info "Cleaning outputs..."
     
-    local dirs_to_clean=("$OUTPUT_DIR" "$DATA_DIR" "$LOG_DIR" "$TARGETS_DIR")
+    local dirs_to_clean=("$OUTPUT_DIR" "$DATA_DIR" "$LOG_DIR" "$TARGETS_DIR" "$VENV_DIR")
     for dir in "${dirs_to_clean[@]}"; do
         [[ -e "$dir" ]] && rm -rf "$dir"
     done
@@ -330,6 +361,8 @@ clean() {
 }
 
 main() {
+    check_os_support
+
     if (( $# == 0 )); then
         show_help
         exit 1
@@ -351,7 +384,7 @@ main() {
             ensure_uv_installed
             ;;
         --rl)
-            log_error "--rl is not a standalone command. Use: $0 --train --rl <dpo|grpo> [other options]"
+            log_error "--rl is not a standalone command. Use: $0 --train --rl <dpo|cpo|kto|orpo> [other options]"
             show_help
             exit 1
             ;;

@@ -1,88 +1,88 @@
 common:
-  model: "Qwen/Qwen3.5-0.8B"
-  parameter_efficient_mode: "lora-tag-tuning"
+  model: "Qwen/Qwen3.5-0.8B"                        # Base causal language model
+  parameter_efficient_mode: "lora-cog-tuned"        # PEFT strategy
 
-  dataset: "truthfulqa"                     # Default dataset
-  hf_hub_token: ""                          # Hugging Face token
-  batch_size: 1                             # Batch size for training or evaluation
-  load_in_8bit: false                       # Load model in 8-bit quantization
-  load_in_4bit: false                       # Load model in 4-bit quantization
-  seed: 42                                  # Random seed for reproducibility
+  dataset: "truthfulqa"                             # Default dataset
+  hf_hub_token: ""                                  # Hugging Face token
+  batch_size: 2                                     # Batch size for training or evaluation
+  load_in_8bit: false                               # Load model in 8-bit quantization
+  load_in_4bit: false                               # Load model in 4-bit quantization
+  seed: 42                                          # Random seed for reproducibility
 
   lora_config:
-    r: 16                                   # Higher rank for complex reasoning
-    alpha: 32                               # Larger alpha for stronger updates
-    dropout: 0.2                            # Lower dropout - truthfulness requires precision
-    bias: "lora_only"                       # Keep bias for offset learning
-    inference_mode: false
-    target_modules:
+    r: 16                                           # Higher rank for complex reasoning
+    alpha: 16                                       # Larger alpha for stronger updates
+    dropout: 0.05                                   # Lower dropout - truthfulness requires precision
+    bias: "lora_only"                               # Keep bias for offset learning
+    target_modules:                                 # Modules to adapt
       - "q_proj"
       - "k_proj"
       - "v_proj"
       - "o_proj"
+      - "up_proj"
       - "gate_proj"
       - "down_proj"
-    init_lora_weights: true
-    fan_in_fan_out: false
-    use_rslora: true
-    module: "all"                           # LoRA module selection (used only if target_modules is empty)
-                                            #   'all': Apply LoRA to both attention and MLP layers (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj)
-                                            #   'atten': Apply only to attention layers (q_proj, k_proj, v_proj, o_proj)
-                                            #   'mlp': Apply only to MLP layers (gate_proj, up_proj, down_proj)
-                                            #   'q_v': Apply only to query and value projections (q_proj, v_proj)
+    init_lora_weights: true                         # Initialize LoRA weights
+    fan_in_fan_out: false                           # Set to true only for specific architectures like GPT-2
+    use_rslora: true                                # Applies Rank-Stabilized LoRA
+    module: "all"                                   # Fallback module selection if target_modules list is empty
 
 train:
-  learning_rate: 0.00001                    # Learning rate
-  num_train_epochs: 1                       # Number of training epochs
-  max_prompt_length: 512                    # Maximum token length for the input prompt
-  max_completion_length: 1024               # Maximum token length for the model's completion
-  warmup_steps: 100                         # Warmup steps for scheduler
-  gradient_accumulation_steps: 1            # Gradient accumulation steps
-  logging_steps: 1000                       # Log every N steps
-  eval_steps: null                          # Evaluate every N steps
-  save_steps: 0                             # Save checkpoint every N steps
-  save_total_limit: 1                       # Keep only last N checkpoints
-  fp16: true                                # FP16 mixed precision training
+  learning_rate: 0.00001                            # Peak learning rate for the optimizer
+  num_train_epochs: 1                               # Number of training epochs
+  max_prompt_length: 512                            # Maximum token length for the input prompt
+  max_completion_length: 2048                       # Maximum token length for the model's completion
+  warmup_steps: 100                                 # Warmup steps for scheduler
+  gradient_accumulation_steps: 8                    # Gradient accumulation steps
+  logging_steps: 1000                               # Log every N steps
+  eval_steps: null                                  # Evaluate every N steps
+  save_steps: 0                                     # Save checkpoint every N steps
+  save_total_limit: 1                               # Keep only last N checkpoints
+  fp16: false                                       # Whether to apply standard 16-bit float precision
+  bf16: true                                        # Whether to apply bfloat16 mixed precision
+
+rl:
+  training_mode: "dpo"                              # Post-training alignment algorithm ('dpo', 'cpo', 'kto', or 'orpo')
 
 generator:
-  backend: "vllm"                           # 'api' | 'vllm'
-  mode: "train"                             # Default mode for generation
-  temperature: 0.3                          # Temperature for generation
-  top_p: 1.0                                # Nucleus sampling parameter
-  frequency_penalty: 0.0                    # Frequency penalty
-  presence_penalty: 0.0                     # Presence penalty
-  stop_sequences: []                        # Stop sequences for generation
-  incremental_save: false                   # Save results incrementally
-  min_memory_steps: 0                       # Minimum number of <memory> steps (factual knowledge retrieval) required in each CoT
-  min_reason_steps: 1                       # Minimum number of <reason> steps (logical reasoning) required in each CoT
-  max_cot_validation_attempts: 3            # Maximum number of attempts to validate and regenerate CoT steps for each example
-  max_generation_attempts: 3                # Maximum number of retries for generating a qualified example with valid CoT steps
-  require_memory_before_reason: false       # Whether to require at least one <memory> (factual knowledge) step before any <reason> (reasoning) steps
-  require_both_memory_reason: false         # Whether to require both <memory> and <reason> step types in each CoT
-  validate_cot_steps: true                  # Whether to validate the quality and structure of generated Chain-of-Thought steps
-  max_retries: 1                            # Maximum number of retry attempts
+  backend: "vllm"                                   # Generation backend: 'vllm' (local) or 'api' (external provider)
+  mode: "train"                                     # Default mode for generation
+  temperature: 0.3                                  # Sampling temperature
+  top_p: 1.0                                        # Nucleus sampling limit
+  frequency_penalty: 0.0                            # Frequency penalty
+  presence_penalty: 0.0                             # Presence penalty
+  stop_sequences: []                                # Specific string sequences that will immediately halt generation
+  incremental_save: false                           # Save results incrementally
+  min_memory_steps: 0                               # Minimum number of <memory> steps (factual knowledge retrieval) required in each CoT
+  min_reason_steps: 1                               # Minimum number of <reason> steps (logical reasoning) required in each CoT
+  max_cot_validation_attempts: 3                    # Maximum number of attempts to validate and regenerate CoT steps for each example
+  max_generation_attempts: 3                        # Maximum number of retries for generating a qualified example with valid CoT steps
+  require_memory_before_reason: false               # Whether to require at least one <memory> (factual knowledge) step before any <reason> (reasoning) steps
+  require_both_memory_reason: false                 # Whether to require both <memory> and <reason> step types in each CoT
+  validate_cot_steps: true                          # Whether to validate the quality and structure of generated Chain-of-Thought steps
+  max_retries: 1                                    # Maximum number of retry attempts
 
-  api:                                      # API configuration (used when backend='api')
-    api_key: ""                             # API key for the LLM service
-    api_base: "https://api.openai.com/v1"   # API endpoint URL
-    timeout: 60                             # Request timeout in seconds
-    retry_min_wait: 1                       # Minimum wait between retries (seconds)
-    retry_max_wait: 60                      # Maximum wait between retries (seconds)
+  api:                                              # API configuration (used when backend='api')
+    api_key: ""                                     # API key for the LLM service
+    api_base: "https://api.openai.com/v1"           # API endpoint URL
+    timeout: 60                                     # Request timeout in seconds
+    retry_min_wait: 1                               # Minimum wait between retries (seconds)
+    retry_max_wait: 60                              # Maximum wait between retries (seconds)
     model: "gpt-4o"
 
-  vllm:                                     # vLLM configuration (used when backend='vllm')
-    tensor_parallel_size: 1                 # Tensor parallelism (number of GPUs)
-    gpu_memory_utilization: 0.8             # GPU memory utilization (0.0-1.0)
-    use_chat_template: true                 # Whether to use chat template for formatting
-    model: "Qwen/Qwen3.5-35B-A3B"
-    system_message: "You are a helpful assistant."
+  vllm:                                             # vLLM configuration (used when backend='vllm')
+    tensor_parallel_size: 1                         # Tensor parallelism (number of GPUs)
+    gpu_memory_utilization: 0.8                     # GPU memory utilization
+    use_chat_template: true                         # Whether to use chat template for formatting
+    model: "Qwen/Qwen3.5-35B-A3B"                   # Teacher model used to generate the reasoning trajectories
+    system_message: "You are a helpful assistant."  # Base system prompt injected into the generation template
 
 logging:
-  wandb_project: "mem"                      # Weights & Biases project name
-  wandb_entity: null                        # Weights & Biases organization/username
-  log_level: "INFO"                         # Logging level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL'
+  wandb_project: "mem"                              # Weights & Biases project name
+  wandb_entity: null                                # Weights & Biases organization/username
+  log_level: "INFO"                                 # Logging level: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR' | 'CRITICAL'
 
 experiment:
-  name: "mem"
-  notes: "Memory and Reasoning"
-  tags: ["lora", "tag", "tuning"]
+  name: "mem"                                       # Unique run identifier for W&B dashboard and artifact tracking
+  notes: "Memory and Reasoning"                     # Description to help identify the purpose of this experiment later
+  tags: ["lora", "cog", "tuned"]                    # Filterable metadata tags for organizing and comparing runs

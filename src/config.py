@@ -70,11 +70,14 @@ def load_datasets_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     
     return config
 
-def load_rl_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+def load_rl_config(
+    training_mode: str,
+    config_path: Optional[str] = None
+) -> Dict[str, Any]:
     from config import CONF_DIR
     
     if config_path is None:
-        config_path = CONF_DIR / "rl.yaml"
+        config_path = CONF_DIR / f"{training_mode}.yaml"
     
     config_path = Path(config_path)
     if not config_path.exists():
