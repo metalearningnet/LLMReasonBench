@@ -797,7 +797,7 @@ class BaseData(Dataset, ABC):
             logger.info(f"Target (y) [{len(item['y'])} chars]:")
             logger.info(f"  {item['y'][:200]}...")
 
-class JsonBasedData(BaseData):
+class JsonDataset(BaseData):
     INSTRUCTION = ""
 
     def __init__(self, name: str, split: str, config: DataConfig):

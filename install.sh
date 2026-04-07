@@ -1,10 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-OS=$(uname -s)
-
-UV_INSTALL_METHOD=${UV_INSTALL_METHOD:-standalone}
+PYTHON=${PYTHON:-python3}
+TORCH_VERSION=${TORCH_VERSION:-2.10.0}
+TORCH_CUDA_VERSION=${TORCH_CUDA_VERSION:-cu130}
+UV_VLLM_VERSION=${UV_VLLM_VERSION:-0.19.0}
 UV_PYTHON_VERSION=${UV_PYTHON_VERSION:-3.12}
+UV_INSTALL_METHOD=${UV_INSTALL_METHOD:-standalone}
+
+OS=$(uname -s)
 
 readonly DATASET_LOADER_SCRIPT="src/dataset_loader.py"
 readonly MD_TARGET_DIR="./targets/md"
@@ -80,13 +84,13 @@ ensure_uv_installed() {
 
     if [[ "$UV_INSTALL_METHOD" == "pip" ]]; then
         log_info "Installing uv with pip..."
-        if ! command -v python3 &>/dev/null; then
-            log_error "python3 not found, cannot install uv via pip."
+        if ! command -v "$PYTHON" &>/dev/null; then
+            log_error "$PYTHON not found, cannot install uv via pip."
         fi
 
-        python3 -m pip --version &>/dev/null || log_error "pip not available for python3"
+        "$PYTHON" -m pip --version &>/dev/null || log_error "pip not available for $PYTHON"
 
-        python3 -m pip install --user uv || log_error "pip install uv failed"
+        "$PYTHON" -m pip install --user uv || log_error "pip install uv failed"
 
         add_common_uv_paths
 
@@ -142,50 +146,37 @@ DATASET_STREAMING=false
 DATASET_INDENT=4
 DATASET_OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
 
-show_usage() {
+usage() {
     cat << EOF
-Usage: $0 [OPTIONS]
+${BOLD}USAGE${RESET}
+    $0 [OPTIONS]
 
-Package Installation (Default):
-  (no arguments)               Install all Python packages
-  --help, -h                   Show this help message
+${BOLD}MODES${RESET}
+    (no arguments)               Install all Python packages
+    --model MODEL                Install a model (currently only 'md')
+    --dataset DATASET            Download a Hugging Face dataset
 
-Model Installation:
-  --model MODEL                [Required] Model name to install (currently only 'md' supported)
-  --path PATH                  Local path to model (requires --model)
+${BOLD}MODEL INSTALLATION OPTIONS${RESET}
+    --model MODEL                Model name to install (required, only 'md' supported)
+    --path PATH                  Local directory path to an existing model
+                                 If not provided, clones from GitHub.
 
-Dataset Installation:
-  --dataset DATASET            [Required] Hugging Face dataset identifier
-                               Example: 'metalearningnet/qwen3.5-metamathqa-cot'
+${BOLD}DATASET INSTALLATION OPTIONS${RESET}
+    --dataset DATASET            Hugging Face dataset identifier (required)
+                                 Example: 'metalearningnet/qwen3-metamathqa-cot'
+    --name NAME                  Output filename without extension (required)
+                                 Example: 'metamathqa' → 'metamathqa_train.json'
+    --split SPLIT                Dataset split to download
+    --config CONFIG              Configuration name for multi‑config datasets
+    --max-length LENGTH          Limit number of examples
+    --output-dir DIR             Directory to save the dataset
 
-  --config CONFIG              Configuration name for multi-configuration datasets
+${BOLD}GENERAL OPTIONS${RESET}
+    --help, -h                   Show this help message
 
-  --name NAME                  [Required] Output filename (without extension)
-                               Example: 'metamathqa' -> creates 'metamathqa_train.json'
-
-  --split SPLIT                Dataset split to download (default: 'train')
-
-  --max-length LENGTH          Limit number of examples
-
-  --output-dir DIR             Directory to save downloaded dataset (default: 'data')
-
-============================================================================
-EXAMPLES:
-============================================================================
-
-Package Installation:
-  ./install.sh                 # Install all Python packages
-
-Model Installation:
-  ./install.sh --model md      # Install MD model from GitHub
-  ./install.sh --model md --path /path/to/local/md  # Install from local directory
-
-Dataset Installation:
-  ./install.sh --dataset metalearningnet/qwen3.5-metamathqa-cot --name metamathqa --split test
-
-Environment Variables:
-  UV_INSTALL_METHOD            How to install uv if missing: "standalone" (default) or "pip"
-  UV_PYTHON_VERSION            Python version for virtual environment (default: 3.12)
+${BOLD}ENVIRONMENT VARIABLES${RESET}
+    UV_VLLM_VERSION              vLLM package version
+    UV_INSTALL_METHOD            How to install uv if missing: 'standalone' or 'pip'
 
 EOF
 }
@@ -266,7 +257,7 @@ parse_arguments() {
                 fi
                 ;;
             --help|-h)
-                show_usage
+                usage
                 exit 0
                 ;;
             -*)
@@ -311,11 +302,20 @@ validate_arguments() {
     fi
 }
 
+install_pytorch() {
+    log_info "Installing PyTorch with CUDA version $TORCH_CUDA_VERSION..."
+    local index_url="https://download.pytorch.org/whl/$TORCH_CUDA_VERSION"
+    uv pip install "torch==$TORCH_VERSION" torchvision torchaudio --index-url "$index_url" \
+        || log_error "Failed to install PyTorch from $index_url"
+
+    log_info "Verifying PyTorch installation..."
+    if ! uv run python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'" 2>/dev/null; then
+        log_error "PyTorch CUDA test failed. This often indicates a missing or incompatible NCCL library."
+    fi
+    log_info "PyTorch installed and CUDA is available."
+}
+
 install_packages() {
-    setup_venv
-
-    log_info "Installing Python packages with uv..."
-
     local package_list=(
         absl-py accelerate aiohappyeyeballs aiohttp aiosignal
         altair annotated-types anyio asttokens async-timeout
@@ -342,33 +342,25 @@ install_packages() {
         sentence-transformers sentencepiece sentry-sdk seqeval setproctitle
         six smmap sniffio stack-data streamlit
         StrEnum sympy tenacity tensorboard tensorboard-data-server
-        threadpoolctl tokenizers toml torch torchaudio
-        torchvision tornado tqdm traitlets
+        threadpoolctl tokenizers toml tornado tqdm traitlets
         triton typing_extensions tzdata urllib3 wandb
         watchdog wcwidth Werkzeug xxhash yarl zipp trl
     )
 
-    log_info "Installing vLLM nightly build..."
-    export UV_TORCH_BACKEND=auto
-    uv pip install -U vllm --extra-index-url https://wheels.vllm.ai/nightly || log_warning "vLLM installation failed"
-
-    log_info "Installing ${#package_list[@]} additional packages..."
+    log_info "Installing Python packages..."
     if uv pip install "${package_list[@]}"; then
         log_info "All packages installed successfully"
     else
         log_error "Failed to install packages"
     fi
 
-    if uv pip install -U transformers; then
-        log_info "Transformers is up to date"
-    else
-        log_warning "Failed to upgrade Transformers"
-    fi
+    log_info "Installing vLLM version ${UV_VLLM_VERSION}..."
+    export UV_TORCH_BACKEND=auto
+    uv pip install "vllm==${UV_VLLM_VERSION}" || log_warning "vLLM installation failed"
+    uv pip install -U transformers || log_warning "Failed to upgrade Transformers"
 }
 
 install_model() {
-    setup_venv
-
     log_info "Installing $MODEL_NAME model..."
 
     if [[ "$MODEL_NAME" != "md" ]]; then
@@ -406,8 +398,6 @@ install_model() {
 }
 
 install_dataset() {
-    setup_venv
-
     log_info "Downloading dataset..."
 
     if [[ ! -f "$DATASET_LOADER_SCRIPT" ]]; then
@@ -457,8 +447,10 @@ main() {
     ensure_uv_installed
     parse_arguments "$@"
     validate_arguments
+    setup_venv
 
     if [[ "$INSTALL_PACKAGES" == true ]]; then
+        install_pytorch
         install_packages
     elif [[ "$INSTALL_MODEL" == true ]]; then
         install_model

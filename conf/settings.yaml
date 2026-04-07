@@ -1,5 +1,5 @@
 common:
-  model: "Qwen/Qwen3.5-0.8B"                        # Base causal language model
+  model: "Qwen/Qwen3.5-4B"                          # Base causal language model
   parameter_efficient_mode: "lora-cog-tuned"        # PEFT strategy
 
   dataset: "truthfulqa"                             # Default dataset
@@ -53,12 +53,8 @@ generator:
   presence_penalty: 0.0                             # Presence penalty
   stop_sequences: []                                # Specific string sequences that will immediately halt generation
   incremental_save: false                           # Save results incrementally
-  min_memory_steps: 0                               # Minimum number of <memory> steps (factual knowledge retrieval) required in each CoT
-  min_reason_steps: 1                               # Minimum number of <reason> steps (logical reasoning) required in each CoT
   max_cot_validation_attempts: 3                    # Maximum number of attempts to validate and regenerate CoT steps for each example
   max_generation_attempts: 3                        # Maximum number of retries for generating a qualified example with valid CoT steps
-  require_memory_before_reason: false               # Whether to require at least one <memory> (factual knowledge) step before any <reason> (reasoning) steps
-  require_both_memory_reason: false                 # Whether to require both <memory> and <reason> step types in each CoT
   validate_cot_steps: true                          # Whether to validate the quality and structure of generated Chain-of-Thought steps
   max_retries: 1                                    # Maximum number of retry attempts
 
@@ -74,8 +70,8 @@ generator:
     tensor_parallel_size: 1                         # Tensor parallelism (number of GPUs)
     gpu_memory_utilization: 0.8                     # GPU memory utilization
     use_chat_template: true                         # Whether to use chat template for formatting
-    model: "Qwen/Qwen3.5-35B-A3B"                   # Teacher model used to generate the reasoning trajectories
-    system_message: "You are a helpful assistant."  # Base system prompt injected into the generation template
+    model: "Qwen/Qwen3.5-27B"                       # Teacher model used to generate the reasoning trajectories
+    system_message: "You are a reasoning engine."   # System prompt injected at the start of conversations to steer model behavior and role
 
 logging:
   wandb_project: "mem"                              # Weights & Biases project name

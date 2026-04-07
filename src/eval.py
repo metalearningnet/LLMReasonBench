@@ -21,9 +21,11 @@ from dataclasses import dataclass, field, asdict
 from peft_model import PeftModelForCausalLMWrapper
 from typing import Optional, Dict, List, Tuple, Any
 from config import (
-    COT_TOKEN_NAMES, DEFAULT_EVAL_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR, MD_PATH, MD_SRC, RESERVED_MODELS,
+    COT_TOKENS, DEFAULT_EVAL_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR, MD_PATH, MD_SRC, RESERVED_MODELS,
     load_config, load_datasets_config, update_dataclass_from_config, setup_directories, dataset_names, logger
 )
+
+COT_TOKEN_NAMES = list(COT_TOKENS.keys())
 
 @dataclass
 class ModelArguments:

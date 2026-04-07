@@ -11,10 +11,12 @@ from dataclasses import dataclass, field
 from transformers import HfArgumentParser
 from typing import List, Dict, Any, Optional, Tuple, Set
 from config import (
-    REASON_TOKEN, CHOICE_MAP, DEFAULT_DATA_DIR, LLM_API_BASE, LLM_API_MODEL,
-    STEPS, COT_TOKEN_NAMES, MEMORY_TOKEN, MEMORY_TOKEN_NAME,
+    CHOICE_MAP, DEFAULT_DATA_DIR, LLM_API_BASE, LLM_API_MODEL, COT_TOKENS, END_MARK,
     load_config, load_datasets_config, logger, dataset_names
 )
+
+COT_TOKEN_NAMES = list(COT_TOKENS.keys())
+ENABLE_THINKING = False
 
 for logger_name in ["openai", "httpx", "httpcore", "urllib3"]:
     logging.getLogger(logger_name).setLevel(logging.WARNING)
@@ -256,14 +258,30 @@ class VLLMClient(BaseLLMClient):
         self.seed = config['common'].get('seed', 42)
         self.use_chat_template = vllm_config.get('use_chat_template', True)
         self.tensor_parallel_size = vllm_config.get('tensor_parallel_size', 1)
-        self.gpu_memory_utilization = vllm_config.get('gpu_memory_utilization', 0.9)
+        self.gpu_memory_utilization = vllm_config.get('gpu_memory_utilization', 0.8)
         self.system_message = vllm_config.get('system_message', "You are a helpful assistant.")
+
+        logger.info(f"System message: {self.system_message}")
         
         if not self.model:
             raise ValueError("vLLM requires model_path to be specified in config")
         
         self._initialize_vllm()
     
+    def _get_tokenizer(self, llm, model_name):
+        tokenizer = llm.get_tokenizer()
+        if 'gemma-4' in model_name.lower():
+            if tokenizer.chat_template is not None:
+                return tokenizer
+
+            # Workaround: Gemma-4 base models have no chat_template (https://github.com/huggingface/transformers/issues/45205)
+            from huggingface_hub import hf_hub_download
+            chat_template_path = hf_hub_download("google/gemma-4-E2B-it", "chat_template.jinja")
+            with open(chat_template_path) as f:
+                tokenizer.chat_template = f.read()
+
+        return tokenizer
+
     def _initialize_vllm(self):
         try:
             logger.info(f"Initializing vLLM with model: {self.model}")
@@ -276,7 +294,7 @@ class VLLMClient(BaseLLMClient):
                 trust_remote_code=True
             )
             
-            self.tokenizer = self.llm.get_tokenizer()
+            self.tokenizer = self._get_tokenizer(self.llm, self.model)
             
             logger.info(f"✓ vLLM initialized successfully with model: {self.model}")
         except Exception as e:
@@ -293,7 +311,8 @@ class VLLMClient(BaseLLMClient):
                 formatted_prompt = self.tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
-                    add_generation_prompt=True
+                    add_generation_prompt=True,
+                    enable_thinking=ENABLE_THINKING
                 )
                 return formatted_prompt
             except Exception as e:
@@ -359,23 +378,24 @@ class CoTGenerator:
         self.backend = backend or generator_config.get('backend', 'api')
         self.llm_client = LLMClientFactory.create_client(config, self.backend)
         self.should_validate_cot_steps = generator_config.get('validate_cot_steps', True)
-        self.require_memory_before_reason = generator_config.get('require_memory_before_reason', False)
-        self.min_memory_steps = generator_config.get('min_memory_steps', 1)
-        self.min_reason_steps = generator_config.get('min_reason_steps', 1)
         self.max_validation_attempts = generator_config.get('max_cot_validation_attempts', 3)
         self.max_generation_attempts = generator_config.get('max_generation_attempts', 3)
-        self.min_cot_steps = generator_config.get('min_cot_steps', 2)
-        self.max_cot_steps = generator_config.get('max_cot_steps', 30)
-        self.require_both_memory_reason = generator_config.get('require_both_memory_reason', False)
-        self.log_raw_responses = config.get('log_raw_responses', False)
+        self.min_cot_steps = generator_config.get('min_cot_steps', 1)
+        self.max_cot_steps = generator_config.get('max_cot_steps', 200)
         self.dataset_configs = config.get('datasets', {})
         self.debug = config.get('debug', False)
+        self.end_mark = END_MARK
         
+        self.prerequisite_tokens = [name for name, cfg in COT_TOKENS.items() if cfg.get('prerequisite', False)]
+        self.regular_tokens = [name for name in COT_TOKENS.keys() if name not in self.prerequisite_tokens]
+
         logger.info(f"Initialized CoTGenerator with backend: {self.backend}")
         if self.debug:
-            logger.info(f"Debug mode enabled")
+            logger.info(f"Prerequisite tokens: {self.prerequisite_tokens}")
+            logger.info(f"Regular tokens: {self.regular_tokens}")
             logger.info(f"Max generation attempts: {self.max_generation_attempts}")
-            logger.info(f"Min CoT steps: {self.min_cot_steps}, Max CoT steps: {self.max_cot_steps}")
+            logger.info(f"Min CoT steps: {self.min_cot_steps}")
+            logger.info(f"Max CoT steps: {self.max_cot_steps}")
     
     def format_example(self, question: str, options: List[str] = None, cot_content: str = "") -> str:
         example = f"Question: {question}"
@@ -391,344 +411,297 @@ class CoTGenerator:
         
         return example
 
-    def planning_prompt(self, question: str, answer: str) -> str:
-        token_descriptions = [
-            f"<{name}>: {STEPS[name]['description']}"
-            for name in COT_TOKEN_NAMES
-        ]
-        
-        guidelines_sections = []
-        for name in COT_TOKEN_NAMES:
-            guidelines = STEPS[name]['guidelines']
-            guidelines_sections.append(f"<{name}>:")
-            guidelines_sections.extend(f"- {guideline}" for guideline in guidelines)
-            guidelines_sections.append("")
-        
-        if guidelines_sections and guidelines_sections[-1] == "":
-            guidelines_sections.pop()
-        
+    def _generate_prerequisite_steps(self, question: str, answer: str) -> List[str]:
+        if not self.prerequisite_tokens:
+            return []
+
+        token_descriptions = []
+        for name in self.prerequisite_tokens:
+            if self.end_mark:
+                token_descriptions.append(f"<{name}> ... </{name}> : {COT_TOKENS[name]['description']}")
+            else:
+                token_descriptions.append(f"<{name}>: ... : {COT_TOKENS[name]['description']}")
         token_types_str = "\n".join(token_descriptions)
-        guidelines_str = "\n".join(guidelines_sections)
-        
-        return f"""Generate a step-by-step reasoning plan to solve the following question:
 
-{question}
+        if self.end_mark:
+            format_instruction = "For each step, use exactly <token_name> content </token_name>."
+        else:
+            format_instruction = "For each step, use exactly <token_name>: content."
 
-TOKEN TYPES:
+        prompt = f"""Generate ONLY the steps for the following token types. Do not output any other text, explanations, or commentary. Output each step on a new line.
+
+Question: {question}
+
+Token types to generate:
 {token_types_str}
 
-CRITICAL RULES:
-- Each step must begin with a token followed by ': '
-- No step numbers
-- Never write tokens without angle brackets (e.g., use "{MEMORY_TOKEN}:" not "{MEMORY_TOKEN_NAME}:")
-- Never add explanatory text after the token (e.g., use "{MEMORY_TOKEN}:" not "{MEMORY_TOKEN} step:")
-- Never prefix tokens with "Step:" (e.g., use "{MEMORY_TOKEN}:" not "Step: {MEMORY_TOKEN}:")
-- Each step should contain only one type of content
-- Do not include any commentary about the task. Only write the steps in the specified format.
+{format_instruction}
 
-GUIDELINES BY TOKEN TYPE:
-{guidelines_str}
-
-Now, generate the CoT steps for the question above:
-
-Begin immediately with the first token:
+Now output the steps, one per line, starting immediately:
 """
-    
-    def ner_agent_prompt(self, questions: List[str]) -> str:
-        """
-        Generate the NER (Named Entity Recognition) agent prompt for factual knowledge.
-        
-        Args:
-            questions: List of knowledge queries
-            
-        Returns:
-            Formatted NER prompt
-        """
-        questions_text = "\n".join(f"- {q}" for q in questions)
-        return f"""You are a factual knowledge provider. For each query below, provide the factual knowledge that can be verified through evidence or observation.
+        if self.debug:
+            logger.info(f"Prerequisite prompt: {prompt}")
 
-Queries:
-{questions_text}
-
-Provide your response as a JSON dictionary where:
-- Keys are the exact query strings from above
-- Values are concise factual knowledge statements
-
-Format your response EXACTLY as:
-```json
-{{
-  "query 1": "factual knowledge for query 1",
-  "query 2": "factual knowledge for query 2",
-  ...
-}}
-```
-
-Important:
-- Only include the JSON in your response.
-- Do not add any additional text or explanation.
-- Ensure the JSON is properly formatted.
-"""
-    
-    def extract_knowledge_based(self, text: str) -> List[str]:
-        if not text or not text.strip():
+        try:
+            response = self.llm_client.get_response(prompt)
+            if not response or not response.strip():
+                return []
+            if self.debug:
+                logger.info(f"Prerequisite response: {response[:1000]}...")
+            steps = self.extract_labeled_content(response)
+            filtered = []
+            for step in steps:
+                token_name, _ = self._parse_step(step)
+                if token_name in self.prerequisite_tokens:
+                    filtered.append(step)
+            return filtered
+        except Exception as e:
+            logger.error(f"Error generating prerequisite steps: {e}")
             return []
         
-        patterns = [
-            r"\*\*Knowledge based\*\*:\s*(.*?)(?=\*\*Content\*\*:|$)",
-            r'Knowledge based:\s*(.*?)(?=Content:|$)',
-            r'Knowledge query:\s*(.*?)(?=Content:|$)',
-            r'Query:\s*(.*?)(?=Content:|$)'
-        ]
-        
-        all_queries = []
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
-            if matches:
-                queries = []
-                for match in matches:
-                    clean_match = match.strip()
-                    clean_match = re.sub(r'\*\*Content\*\*.*$', '', clean_match, flags=re.DOTALL | re.IGNORECASE)
-                    clean_match = clean_match.strip()
-                    if clean_match:
-                        queries.append(clean_match)
-                
-                if queries:
-                    all_queries.extend(queries)
-                    if self.debug:
-                        logger.debug(f"Found {len(queries)} queries with pattern: {pattern[:30]}...")
-                    break
-        
-        seen = set()
-        unique_queries = []
-        for query in all_queries:
-            if query not in seen and len(query) > 5:
-                seen.add(query)
-                unique_queries.append(query)
-        
-        if self.debug and unique_queries:
-            logger.debug(f"Extracted {len(unique_queries)} unique knowledge queries")
-        
-        return unique_queries
-    
+    def planning_prompt(self, question: str, answer: str, prerequisite_steps: List[str] = None) -> str:
+        token_descriptions = []
+        for name in self.regular_tokens:
+            if self.end_mark:
+                token_descriptions.append(f"<{name}> ... </{name}> - {COT_TOKENS[name]['description']}")
+            else:
+                token_descriptions.append(f"<{name}>: ... - {COT_TOKENS[name]['description']}")
+        token_types_str = "\n".join(token_descriptions)
+
+        if self.end_mark:
+            format_instruction = (
+                "For labeled steps, use exactly <token_name> content </token_name>, "
+                "where token_name must be one of the token types listed above."
+            )
+        else:
+            format_instruction = (
+                "For labeled steps, use exactly <token_name>: content, "
+                "where token_name must be one of the token types listed above."
+            )
+
+        context = ""
+        if prerequisite_steps:
+            context = "Pre‑generated steps (use these as facts for the remaining reasoning):\n" + "\n".join(prerequisite_steps) + "\n\n"
+
+        prompt = f"""Solve the question using step-by-step reasoning. Output each step on a new line. Do not output any extra text like "Step 1", "Thinking process", or explanations. Only the reasoning steps.
+
+Question: {question}
+
+{context}Available token types:
+{token_types_str}
+
+{format_instruction}
+
+Steps that do not correspond to any token type can be plain text (unlabeled). However, at least one step must be labeled with a token from the list above.
+
+Now output your reasoning steps, one per line, starting immediately:
+"""
+        return prompt
+
     def extract_labeled_content(self, input_string: str) -> List[str]:
         if not input_string or not input_string.strip():
             return []
-        
-        input_string = input_string.strip()
-        
+
         token_names_pattern = '|'.join(re.escape(name) for name in COT_TOKEN_NAMES)
-        pattern = rf'<({token_names_pattern})>:\s*([^<]+?)(?=\s*<({token_names_pattern})>|$)'
-        
+
+        if not self.end_mark:
+            lines = input_string.strip().split('\n')
+            steps = []
+
+            skip_patterns = [
+                r'^\s*[\*\-]\s+',
+                r'^\s*\d+\.\s+',
+                r'(available token types|for labeled steps|critical rules|now output|pre‑generated steps|question:)'
+            ]
+            compiled_skip = re.compile('|'.join(skip_patterns), re.IGNORECASE)
+
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if compiled_skip.search(line):
+                    continue
+
+                token_match = re.match(rf'^<({token_names_pattern})>:\s*(.*)$', line, re.IGNORECASE)
+                if token_match:
+                    steps.append(line)
+                else:
+                    line = re.sub(r'\s+', ' ', line)
+                    if line and line[0].islower():
+                        line = line[0].upper() + line[1:]
+                    if line and not any(line.endswith(p) for p in ['.', '!', '?', ':']):
+                        if len(line.split()) > 2:
+                            line += '.'
+                    steps.append(line)
+
+            seen = set()
+            unique = []
+            for s in steps:
+                if s not in seen:
+                    seen.add(s)
+                    unique.append(s)
+            return unique
+
+        pattern = rf'<({token_names_pattern})>\s*(.*?)\s*</\1>'
+        flags = re.IGNORECASE | re.DOTALL
+        matches = list(re.finditer(pattern, input_string, flags))
+
         steps = []
-        for match in re.finditer(pattern, input_string, re.IGNORECASE | re.DOTALL):
-            token_name = match.group(1).lower()
-            content = match.group(2).strip()
-            
-            if not content:
-                continue
-            
-            content = re.sub(r'\s+', ' ', content).strip()
-            
-            if self._is_garbage_content(content):
-                continue
-            
-            if content and content[0].islower():
-                content = content[0].upper() + content[1:]
-            
-            if content and not any(content.endswith(p) for p in ['.', '!', '?', ':']):
-                if len(content.split()) > 2:
-                    content = content + '.'
-            
-            steps.append(f"<{token_name}>: {content}")
-        
-        if not steps:
-            pattern2 = rf'<({token_names_pattern})>:\s*([^\n]+)'
-            for match in re.finditer(pattern2, input_string, re.IGNORECASE):
-                token_name = match.group(1).lower()
-                content = match.group(2).strip()
-                
-                if not content:
-                    continue
-                
-                content = re.sub(r'\s+', ' ', content).strip()
-                
-                if self._is_garbage_content(content):
-                    continue
-                
-                if content and content[0].islower():
-                    content = content[0].upper() + content[1:]
-                
-                if content and not any(content.endswith(p) for p in ['.', '!', '?', ':']):
-                    if len(content.split()) > 2:
-                        content = content + '.'
-                
-                steps.append(f"<{token_name}>: {content}")
-        
-        seen = set()
-        unique_steps = []
+        pos = 0
+        for match in matches:
+            if pos < match.start():
+                unlabeled = input_string[pos:match.start()].strip()
+                if unlabeled:
+                    unlabeled = re.sub(r'\s+', ' ', unlabeled)
+                    if unlabeled and unlabeled[0].islower():
+                        unlabeled = unlabeled[0].upper() + unlabeled[1:]
+                    if unlabeled and not any(unlabeled.endswith(p) for p in ['.', '!', '?', ':']):
+                        if len(unlabeled.split()) > 2:
+                            unlabeled += '.'
+                    steps.append(unlabeled)
+            token_step = match.group(0).strip()
+            if token_step:
+                steps.append(token_step)
+            pos = match.end()
+
+        if pos < len(input_string):
+            tail = input_string[pos:].strip()
+            if tail:
+                tail = re.sub(r'\s+', ' ', tail)
+                if tail and tail[0].islower():
+                    tail = tail[0].upper() + tail[1:]
+                if tail and not any(tail.endswith(p) for p in ['.', '!', '?', ':']):
+                    if len(tail.split()) > 2:
+                        tail += '.'
+                steps.append(tail)
+
+        valid_token_pattern = rf'^\s*<({token_names_pattern})>\s*.*?\s*</\1>\s*$'
+        filtered = []
         for step in steps:
+            if '<' in step or '>' in step:
+                if re.match(valid_token_pattern, step, re.DOTALL):
+                    filtered.append(step)
+            else:
+                filtered.append(step)
+
+        seen = set()
+        unique = []
+        for step in filtered:
             if step not in seen:
                 seen.add(step)
-                unique_steps.append(step)
-        
-        return unique_steps
+                unique.append(step)
+        return unique
     
-    def clean_json_string(self, json_str: str) -> Dict:
-        if not json_str or not json_str.strip():
-            return {}
-        
-        json_str = json_str.strip()
-        
-        if self.debug:
-            logger.debug(f"Cleaning JSON string (first 200 chars): {json_str[:200]}")
-        
-        # Remove code blocks
-        json_str = re.sub(r'```(?:json)?\s*', '', json_str)
-        json_str = re.sub(r'\s*```', '', json_str)
-        
-        # Remove non-JSON content before and after
-        json_match = re.search(r'\{.*\}', json_str, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(0)
-        
-        # Fix common JSON issues
-        json_str = json_str.replace('\n', ' ').replace('\r', ' ')
-        
-        # Remove empty key-value pairs
-        json_str = re.sub(r'"[^"]*"\s*:\s*""\s*,?', '', json_str)
-        
-        # Fix trailing commas
-        json_str = re.sub(r',\s*}', '}', json_str)
-        json_str = re.sub(r',\s*]', ']', json_str)
-        
-        # Remove extra whitespace
-        json_str = re.sub(r'\s+', ' ', json_str)
-        
-        # Validate braces
-        open_braces = json_str.count('{')
-        close_braces = json_str.count('}')
-        
-        if open_braces != close_braces:
-            if self.debug:
-                logger.debug(f"Unbalanced braces: {open_braces} open, {close_braces} close")
-            # Try to fix by adding missing braces
-            if open_braces > close_braces:
-                json_str += '}' * (open_braces - close_braces)
-            else:
-                json_str = '{' * (close_braces - open_braces) + json_str
-        
-        try:
-            result = json.loads(json_str)
-            if self.debug:
-                logger.debug(f"Successfully parsed JSON with {len(result)} keys")
-            return result
-        except json.JSONDecodeError as e:
-            if self.debug:
-                logger.debug(f"JSON decode error: {e}")
-                logger.debug(f"Problematic JSON string: {json_str[:500]}")
-            
-            try:
-                # Try to parse as single string and convert to dict
-                if json_str.startswith('"') and json_str.endswith('"'):
-                    json_str = json_str[1:-1]
-                    # Try to parse the inner string
-                    inner_match = re.search(r'\{.*\}', json_str, re.DOTALL)
-                    if inner_match:
-                        return json.loads(inner_match.group(0))
-                
-                # Try to extract key-value pairs manually
-                key_value_pairs = re.findall(r'"([^"]+)"\s*:\s*"([^"]*)"', json_str)
-                if key_value_pairs:
-                    result = {}
-                    for key, value in key_value_pairs:
-                        result[key] = value
-                    logger.warning(f"Recovered JSON with {len(result)} key-value pairs after error")
-                    return result
-            except Exception as e2:
-                logger.debug(f"Recovery attempt failed: {e2}")
-            
-            return {}
-    
+    def _parse_step(self, step: str) -> Tuple[Optional[str], Optional[str]]:
+        tag_pattern = rf'^\s*<({ "|".join(re.escape(n) for n in COT_TOKEN_NAMES) })>\s*(.*?)\s*</\1>\s*$'
+        match = re.match(tag_pattern, step, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).lower(), match.group(2).strip() # Return (token_name, content)
+        colon_pattern = rf'^\s*<({ "|".join(re.escape(n) for n in COT_TOKEN_NAMES) })>:\s*(.*?)\s*$'
+        match = re.match(colon_pattern, step, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).lower(), match.group(2).strip()
+        return None, None
+
     def validate_cot_steps(self, cot_steps: List[str]) -> bool:
         if not cot_steps:
-            if self.debug:
-                logger.debug("Validation failed: No CoT steps generated")
             return False
-        
         if not self.should_validate_cot_steps:
             return True
-        
-        if len(cot_steps) > self.max_cot_steps:
+
+        single_token_mode = (len(COT_TOKEN_NAMES) == 1)
+        min_steps = 1 if single_token_mode else self.min_cot_steps
+
+        if len(cot_steps) > self.max_cot_steps or len(cot_steps) < min_steps:
             if self.debug:
-                logger.debug(f"Validation failed: Extremely many steps ({len(cot_steps)} > {self.max_cot_steps})")
+                logger.debug(f"Validation failed: step count {len(cot_steps)} not in [{min_steps}, {self.max_cot_steps}]")
             return False
-        
-        if len(cot_steps) < self.min_cot_steps:
-            if self.debug:
-                logger.debug(f"Validation failed: Too few steps ({len(cot_steps)} < 2)")
-            return False
-        
-        token_step_counts = {token_name: 0 for token_name in COT_TOKEN_NAMES}
-        valid_tokens_pattern = '|'.join(re.escape(name) for name in COT_TOKEN_NAMES)
-        
-        content_set = set()
-        unique_content_count = 0
-        
-        for i, step in enumerate(cot_steps):
-            if ': ' not in step:
+
+        token_step_counts = {name: 0 for name in COT_TOKEN_NAMES}
+        seen_content = set()
+
+        for step in cot_steps:
+            token_name, content = self._parse_step(step)
+
+            if ('<' in step or '>' in step) and token_name is None:
                 if self.debug:
-                    logger.debug(f"Validation failed: Step without ': ' separator at {i}: {step[:50]}...")
+                    logger.debug(f"Validation failed: step contains angle brackets but is not a valid token step: {step[:50]}")
                 return False
-            
-            tag_part, content = step.split(': ', 1)
-            tag_part = tag_part.strip()
-            content = content.strip()
-            
-            tag_match = re.search(rf'\<({valid_tokens_pattern})\>', tag_part, re.IGNORECASE)
-            if not tag_match:
+
+            if token_name is None:
+                content = step.strip()
+                if not content:
+                    continue
+                norm_content = content.lower().strip()
+                if norm_content:
+                    seen_content.add(norm_content)
+                continue
+
+            if content is None:
                 if self.debug:
-                    logger.debug(f"Validation failed: Step with invalid tag format at {i}: {tag_part[:50]}...")
+                    logger.debug(f"Validation failed: token step with missing content: {step[:50]}")
                 return False
-            
-            token_name = tag_match.group(1).lower()
-            
-            if not content:
-                if self.debug:
-                    logger.debug(f"Validation failed: Empty content for <{token_name}> at step {i}")
-                return False
-            
+
             if self._is_garbage_content(content):
                 if self.debug:
-                    logger.debug(f"Validation failed: Garbage/incomplete content at step {i}: {content[:50]}...")
+                    logger.debug(f"Validation failed: garbage content in token step: {content[:50]}")
                 return False
-            
-            content_normalized = content.lower().strip()
-            if content_normalized and content_normalized not in content_set:
-                content_set.add(content_normalized)
-                unique_content_count += 1
-            
+
+            norm_content = content.lower().strip()
+            if norm_content:
+                seen_content.add(norm_content)
             token_step_counts[token_name] += 1
-        
-        if unique_content_count < 2:
+
+        if len(seen_content) < 1:
             if self.debug:
-                logger.debug(f"Validation failed: Not enough unique content ({unique_content_count} < 2)")
+                logger.debug(f"Validation failed: no unique content items")
             return False
-        
-        total_steps = len(cot_steps)
-        if total_steps > 3:
-            max_single_type_ratio = 0.85
-            
-            for token_name, count in token_step_counts.items():
-                if count / total_steps > max_single_type_ratio:
+
+        if len(COT_TOKEN_NAMES) > 1 and len(cot_steps) > 3:
+            max_ratio = 0.85
+            total = len(cot_steps)
+            for count in token_step_counts.values():
+                if count / total > max_ratio:
                     if self.debug:
-                        logger.debug(f"Validation failed: Too many <{token_name}> steps ({count}/{total_steps} > {max_single_type_ratio*100}%)")
+                        logger.debug(f"Validation failed: token type ratio {count/total:.2f} exceeds {max_ratio}")
                     return False
-        
-        if self.debug:
-            token_summary = ', '.join([f"{count} <{token}>" for token, count in token_step_counts.items() if count > 0])
-            logger.debug(f"Validation passed: {len(cot_steps)} steps total ({token_summary}), {unique_content_count} unique content items")
-        
+
+        return True
+
+    def is_high_quality_cot(self, cot_steps: List[str]) -> bool:
+        if not cot_steps:
+            return False
+
+        single_token_mode = (len(COT_TOKEN_NAMES) == 1)
+        min_steps = 1 if single_token_mode else self.min_cot_steps
+        if len(cot_steps) < min_steps:
+            return False
+
+        total_content_length = 0
+        has_cot_token = False
+
+        for step in cot_steps:
+            token_name, content = self._parse_step(step)
+
+            if token_name is None and single_token_mode:
+                content = step.strip()
+                if not content:
+                    return False
+                total_content_length += len(content)
+                continue
+
+            if token_name is None or content is None:
+                return False
+
+            total_content_length += len(content)
+            if token_name in COT_TOKENS:
+                has_cot_token = True
+
+        avg_content_length = total_content_length / len(cot_steps)
+        if avg_content_length < 20:
+            return False
+        if not has_cot_token and not single_token_mode:
+            return False
         return True
 
     def _is_garbage_content(self, content: str) -> bool:
@@ -781,81 +754,72 @@ Important:
 
     def get_cot_steps(self, question: str, answer: str) -> List[str]:
         if self.debug:
-            logger.debug(f"Generating CoT for question: {question[:100]}...")
-        
-        planning_prompt = self.planning_prompt(question, answer)
-        
-        if self.log_raw_responses:
+            logger.info(f"Generating CoT for question: {question[:100]}...")
+
+        prereq_steps = self._generate_prerequisite_steps(question, answer)
+        if self.debug:
+            logger.info(f"Generated {len(prereq_steps)} prerequisite steps")
+
+        if self.prerequisite_tokens and not prereq_steps:
+            if self.debug:
+                logger.info("No prerequisite steps generated, aborting generation")
+            return []
+
+        if not self.regular_tokens:
+            if not prereq_steps:
+                return []
+            if not self.validate_cot_steps(prereq_steps):
+                if self.debug:
+                    logger.info("Prerequisite steps failed validation")
+                return [] if self.should_validate_cot_steps else prereq_steps
+            return prereq_steps
+
+        planning_prompt = self.planning_prompt(question, answer, prerequisite_steps=prereq_steps)
+
+        if self.debug:
             logger.info(f"Planning prompt: {planning_prompt}")
-        
+
         try:
             plan_response = self.llm_client.get_response(planning_prompt)
-            
             if not plan_response or plan_response.strip() == "":
                 if self.debug:
-                    logger.debug(f"Empty plan response for question: {question[:50]}...")
+                    logger.info(f"Empty plan response for question: {question[:50]}...")
                 return []
-            
-            if self.log_raw_responses:
-                logger.info(f"Plan response (first 1000 chars): {plan_response[:1000]}...")
-            
             if self.debug:
-                logger.debug(f"Plan response length: {len(plan_response)} characters")
+                logger.info(f"Plan response (first 1000 chars): {plan_response[:1000]}...")
+            if self.debug:
+                logger.info(f"Plan response length: {len(plan_response)} characters")
         except Exception as e:
             logger.error(f"Error getting planning response: {e}")
             return []
-        
-        # Extract knowledge-based queries
-        kb_queries = self.extract_knowledge_based(plan_response)
-        
-        if kb_queries:
-            if self.debug:
-                logger.debug(f"Found {len(kb_queries)} knowledge queries")
-            
-            # Get factual knowledge
-            try:
-                ner_prompt = self.ner_agent_prompt(kb_queries)
-                ner_response = self.llm_client.get_response(ner_prompt)
-                
-                if self.log_raw_responses:
-                    logger.info(f"NER response (first 1000 chars): {ner_response[:1000] if ner_response else 'EMPTY'}")
-                
-                try:
-                    kb_dict = self.clean_json_string(ner_response)
-                    if kb_dict:
-                        if self.debug:
-                            logger.debug(f"Successfully parsed {len(kb_dict)} knowledge entries")
-                        
-                        # Replace queries with knowledge in planning
-                        for query, knowledge in kb_dict.items():
-                            if query in plan_response:
-                                plan_response = plan_response.replace(query, f"{query} {MEMORY_TOKEN}{knowledge}")
-                                if self.debug:
-                                    logger.debug(f"Replaced query '{query[:50]}...' with knowledge")
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Failed to parse NER response: {e}")
-            except Exception as e:
-                logger.error(f"Error getting NER response: {e}")
-        
-        cot_steps = self.extract_labeled_content(plan_response)
-        
+
+        reasoning_steps = self.extract_labeled_content(plan_response)
+
         if self.debug:
-            logger.debug(f"Extracted {len(cot_steps)} CoT steps")
+            logger.info(f"Raw planning response:\n{plan_response[:1000]}")
+            logger.info(f"Extracted steps: {reasoning_steps}")
+            logger.info(f"Validation passed: {self.validate_cot_steps(reasoning_steps)}")
+
+        if self.regular_tokens and not any('<' in step or '>' in step for step in reasoning_steps):
+            if self.debug:
+                logger.info("Reasoning steps contain no labeled step; rejecting generation")
+            return []
+
+        cot_steps = prereq_steps + reasoning_steps
         
         if not cot_steps:
             if self.debug:
-                logger.debug("No CoT steps extracted")
+                logger.info("No CoT steps extracted")
             return []
-        
+
         if not self.validate_cot_steps(cot_steps):
             if self.debug:
-                logger.debug("CoT steps failed validation")
-            
+                logger.info("CoT steps failed validation")
             if not self.should_validate_cot_steps:
                 return cot_steps
             else:
                 return []
-        
+
         return cot_steps
     
     def get_cot_steps_with_retry(self, question: str, answer: str, max_attempts: int = None) -> List[str]:
@@ -865,17 +829,17 @@ Important:
             try:
                 if attempt > 0:
                     if self.debug:
-                        logger.debug(f"Retry attempt {attempt + 1}/{max_attempts} for question: {question[:50]}...")
+                        logger.info(f"Retry attempt {attempt + 1}/{max_attempts} for question: {question[:50]}...")
                 
                 cot_steps = self.get_cot_steps(question, answer)
                 
                 if cot_steps:
                     if self.debug:
-                        logger.debug(f"Successfully generated {len(cot_steps)} CoT steps on attempt {attempt + 1}")
+                        logger.info(f"Successfully generated {len(cot_steps)} CoT steps on attempt {attempt + 1}")
                     return cot_steps
                 else:
                     if self.debug:
-                        logger.debug(f"Empty CoT steps on attempt {attempt + 1}/{max_attempts}")
+                        logger.info(f"Empty CoT steps on attempt {attempt + 1}/{max_attempts}")
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed: {e}")
                 
@@ -888,154 +852,108 @@ Important:
     def batch_generate_cot_steps(self, questions: List[str], answers: List[str]) -> List[List[str]]:
         if len(questions) != len(answers):
             raise ValueError(f"Number of questions ({len(questions)}) doesn't match number of answers ({len(answers)})")
-        
+
+        all_prereq_steps = []
+        example_valid = []
+        for q, a in zip(questions, answers):
+            prereq = self._generate_prerequisite_steps(q, a)
+            all_prereq_steps.append(prereq)
+            if self.prerequisite_tokens and not prereq:
+                example_valid.append(False)
+            else:
+                example_valid.append(True)
+
+        if not self.regular_tokens:
+            all_cot_steps = []
+            validation_stats = {"valid": 0, "invalid": 0, "empty": 0}
+            for i, is_valid in enumerate(example_valid):
+                if not is_valid:
+                    all_cot_steps.append([])
+                    validation_stats["invalid"] += 1
+                    continue
+                cot_steps = all_prereq_steps[i]
+                if not cot_steps:
+                    all_cot_steps.append([])
+                    validation_stats["empty"] += 1
+                    continue
+                if self.should_validate_cot_steps:
+                    is_valid_steps = self.validate_cot_steps(cot_steps)
+                    if is_valid_steps:
+                        all_cot_steps.append(cot_steps)
+                        validation_stats["valid"] += 1
+                    else:
+                        all_cot_steps.append([])
+                        validation_stats["invalid"] += 1
+                else:
+                    all_cot_steps.append(cot_steps)
+                    validation_stats["valid"] += 1
+            logger.info(f"CoT generation stats: {validation_stats['valid']} valid, {validation_stats['invalid']} invalid, {validation_stats['empty']} empty")
+            return all_cot_steps
+
         all_planning_prompts = []
-        question_indices = []
-        
-        for i, (question, answer) in enumerate(zip(questions, answers)):
-            planning_prompt = self.planning_prompt(question, answer)
-            all_planning_prompts.append(planning_prompt)
-            question_indices.append(i)
-        
-        logger.info(f"Batch generating planning responses for {len(all_planning_prompts)} questions")
-        
-        try:
-            plan_responses = self.llm_client.get_responses(all_planning_prompts)
-            
-            if self.debug:
-                successful = sum(1 for r in plan_responses if r and r.strip())
-                logger.debug(f"Successfully generated {successful}/{len(plan_responses)} planning responses")
-                for i, (prompt, response) in enumerate(zip(all_planning_prompts[:3], plan_responses[:3])):
-                    logger.debug(f"Example {i} - Response preview: {response[:500] if response else 'EMPTY'}...")
-        except Exception as e:
-            logger.error(f"Failed to generate planning responses: {e}")
-            return [[] for _ in questions]
-        
-        # Extract knowledge-based queries and prepare NER prompts
-        kb_queries_batch = []
-        query_to_question_map = []
-        plan_responses_with_kb = plan_responses.copy()
-        
-        for i, (plan_response, question_idx) in enumerate(zip(plan_responses, question_indices)):
-            if not plan_response or plan_response.strip() == "":
-                if self.debug and i < 5:
-                    logger.debug(f"Empty plan response for question index {question_idx}")
-                continue
-            
-            kb_queries = self.extract_knowledge_based(plan_response)
-            if kb_queries:
-                for query in kb_queries:
-                    kb_queries_batch.append(query)
-                    query_to_question_map.append((question_idx, query, i))
-        
-        if kb_queries_batch:
-            logger.info(f"Batch generating NER responses for {len(kb_queries_batch)} knowledge queries")
-            try:
-                ner_prompt = self.ner_agent_prompt(kb_queries_batch)
-                ner_response = self.llm_client.get_response(ner_prompt)
-                
-                if self.debug:
-                    logger.debug(f"NER response length: {len(ner_response) if ner_response else 0} characters")
-                
-                try:
-                    kb_dict = self.clean_json_string(ner_response)
-                    update_count = 0
-                    for question_idx, query, plan_idx in query_to_question_map:
-                        if query in kb_dict:
-                            knowledge = kb_dict[query]
-                            if query in plan_responses_with_kb[plan_idx]:
-                                plan_responses_with_kb[plan_idx] = plan_responses_with_kb[plan_idx].replace(
-                                    query, f"{query} {MEMORY_TOKEN}{knowledge}"
-                                )
-                                update_count += 1
-                    
-                    if self.debug:
-                        logger.debug(f"Updated {update_count} planning responses with knowledge")
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"Failed to parse NER response: {e}")
-                    if self.debug:
-                        logger.debug(f"Raw NER response (first 500 chars): {ner_response[:500] if ner_response else 'EMPTY'}")
-            except Exception as e:
-                logger.error(f"Failed to generate NER responses: {e}")
-        
+        for i, (q, a) in enumerate(zip(questions, answers)):
+            if not example_valid[i]:
+                all_planning_prompts.append(None)
+            else:
+                all_planning_prompts.append(self.planning_prompt(q, a, prerequisite_steps=all_prereq_steps[i]))
+
+        prompts_to_gen = [p for p in all_planning_prompts if p is not None]
+        if prompts_to_gen:
+            plan_responses = self.llm_client.get_responses(prompts_to_gen)
+        else:
+            plan_responses = []
+
         all_cot_steps = []
         validation_stats = {"valid": 0, "invalid": 0, "empty": 0}
-        
-        for i, plan_response in enumerate(plan_responses_with_kb):
-            if not plan_response or plan_response.strip() == "":
-                all_cot_steps.append([])
-                validation_stats["empty"] += 1
-                if self.debug and i < 5:
-                    logger.debug(f"Example {i}: Empty response")
-                continue
-                
-            cot_steps = self.extract_labeled_content(plan_response)
-            
-            if self.debug and i < 3 and cot_steps:
-                logger.debug(f"Example {i} - Extracted {len(cot_steps)} steps")
-            
-            if not cot_steps:
-                if self.debug and i < 5:
-                    logger.debug(f"Example {i}: No steps extracted from response")
-                all_cot_steps.append([])
-                validation_stats["empty"] += 1
-                continue
-            
-            if len(cot_steps) < self.min_cot_steps:
-                if self.debug and i < 5:
-                    logger.debug(f"Example {i}: Too few steps ({len(cot_steps)} < {self.min_cot_steps})")
+        resp_idx = 0
+
+        for i, is_valid in enumerate(example_valid):
+            if not is_valid:
                 all_cot_steps.append([])
                 validation_stats["invalid"] += 1
                 continue
-            
+
+            plan_response = plan_responses[resp_idx]
+            resp_idx += 1
+
+            if not plan_response or plan_response.strip() == "":
+                all_cot_steps.append([])
+                validation_stats["empty"] += 1
+                continue
+
+            reasoning_steps = self.extract_labeled_content(plan_response)
+
+            if self.regular_tokens and not any('<' in step or '>' in step for step in reasoning_steps):
+                all_cot_steps.append([])
+                validation_stats["invalid"] += 1
+                continue
+
+            cot_steps = all_prereq_steps[i] + reasoning_steps
+
+            if not cot_steps:
+                all_cot_steps.append([])
+                validation_stats["empty"] += 1
+                continue
+
+            if len(cot_steps) < self.min_cot_steps:
+                all_cot_steps.append([])
+                validation_stats["invalid"] += 1
+                continue
+
             if self.should_validate_cot_steps:
-                is_valid = self.validate_cot_steps(cot_steps)
-                if is_valid:
+                is_valid_steps = self.validate_cot_steps(cot_steps)
+                if is_valid_steps:
                     all_cot_steps.append(cot_steps)
                     validation_stats["valid"] += 1
                 else:
-                    if self.debug and i < 5:
-                        logger.debug(f"Example {i}: Steps failed validation")
-                    
-                    all_cot_steps.append(cot_steps)
+                    all_cot_steps.append([])
                     validation_stats["invalid"] += 1
             else:
                 all_cot_steps.append(cot_steps)
                 validation_stats["valid"] += 1
-        
+
         logger.info(f"CoT generation stats: {validation_stats['valid']} valid, {validation_stats['invalid']} invalid, {validation_stats['empty']} empty")
-        
         return all_cot_steps
-    
-    def is_high_quality_cot(self, cot_steps: List[str]) -> bool:
-        if not cot_steps:
-            return False
-        
-        if len(cot_steps) < self.min_cot_steps:
-            return False
-        
-        total_content_length = 0
-        has_memory = False
-        has_reason = False
-        
-        for step in cot_steps:
-            if ': ' in step:
-                tag_part, content = step.split(': ', 1)
-                total_content_length += len(content.strip())
-                
-                if MEMORY_TOKEN in tag_part.lower():
-                    has_memory = True
-                elif REASON_TOKEN in tag_part.lower():
-                    has_reason = True
-        
-        avg_content_length = total_content_length / len(cot_steps)
-        if avg_content_length < 20:
-            return False
-        
-        if self.require_both_memory_reason and not (has_memory and has_reason):
-            return False
-        
-        return True
     
     def generate_with_quality_check(self, question: str, answer: str, max_attempts: int = None) -> List[str]:
         max_attempts = max_attempts or self.max_generation_attempts
@@ -1045,15 +963,15 @@ Important:
             
             if self.is_high_quality_cot(cot_steps):
                 if self.debug:
-                    logger.debug(f"Generated high-quality CoT with {len(cot_steps)} steps on attempt {attempt + 1}")
+                    logger.info(f"Generated high-quality CoT with {len(cot_steps)} steps on attempt {attempt + 1}")
                 return cot_steps
             
             if attempt < max_attempts - 1:
                 if self.debug:
-                    logger.debug(f"CoT quality insufficient, retrying... (attempt {attempt + 1}/{max_attempts})")
+                    logger.info(f"CoT quality insufficient, retrying... (attempt {attempt + 1}/{max_attempts})")
         
         if self.debug:
-            logger.debug(f"Failed to generate high-quality CoT after {max_attempts} attempts")
+            logger.info(f"Failed to generate high-quality CoT after {max_attempts} attempts")
         return []
 
 class DatasetGenerator:
@@ -1079,6 +997,7 @@ class DatasetGenerator:
         
         self.max_retries = self.cot_generator.llm_client.max_retries
         self.batch_size = self.generator_config.get('batch_size', self.cot_generator.llm_client.batch_size)
+        self.debug = self.cot_generator.debug
         
         self._initialize_configuration()
         
@@ -1240,7 +1159,6 @@ class DatasetGenerator:
             
             logger.info(f"Successfully loaded {len(dataset[actual_split])} examples from {source}/{actual_split}")
             return dataset[actual_split]
-            
         except ImportError:
             logger.error("The 'datasets' library is not installed. Please install it with: pip install datasets")
             raise
@@ -1269,49 +1187,78 @@ class DatasetGenerator:
             raise
     
     def filter_results(self, results: List[Dict], split: str) -> List[Dict]:
-        pattern = re.compile(r"^\s*\<(.*?)\>\s*:")
-        cleaned_data = []
-        
+        cleaned = []
+
+        meta_patterns = [
+            r'\bthinking process\b',
+            r'\banalyze the request\b',
+            r'\bconstraint check\b',
+            r'\bdrafting\b',
+            r'\boutput only\b',
+            r'\beach step must be\b',
+            r'\bline\s*\d+\b',
+            r'\bneed to check\b',
+            r'\bokay\b',
+            r'\bnote:\b'
+        ]
+        meta_re = re.compile('|'.join(meta_patterns), re.IGNORECASE)
+
+        # Placeholder content patterns for token steps (excluding "<content>")
+        placeholder_patterns = [
+            r'^\.\.\.$',
+            r'^content$',
+            r'^text$'
+        ]
+        placeholder_re = re.compile('|'.join(placeholder_patterns), re.IGNORECASE)
+
         for item in results:
             if not item:
                 continue
-            
             cot_steps = item.get('cot_steps', [])
-            
-            if split == "test" and not cot_steps:
-                cleaned_data.append(item)
+            if split == "test":
+                cleaned.append(item)
                 continue
-            
-            filtered_steps = [
-                step for step in cot_steps
-                if step and ': ' in step and step.split(': ')[1].strip()
-            ]
-            
-            if not filtered_steps:
-                # Skip examples with no valid CoT steps
-                if split != "test":
+
+            filtered = []
+            for step in cot_steps:
+                step = step.strip()
+                if not step:
                     continue
-                else:
-                    cleaned_data.append(item)
+
+                if len(step) < 3:
                     continue
-            
-            processed_steps = []
-            for entry in filtered_steps:
-                match = pattern.search(entry)
-                if match:
-                    processed_steps.append(entry)
-                else:
-                    processed_steps.append(entry)
-            
-            cleaned_data.append({
+                if re.match(r'^[\d\s\.,!?;:-]+$', step):
+                    continue
+                if '`' in step or '*' in step:
+                    continue
+
+                if meta_re.search(step):
+                    if self.debug:
+                        logger.debug(f"Skipping step due to meta-pattern: {step[:50]}")
+                    continue
+
+                if '<' in step or '>' in step:
+                    token_name, content = self.cot_generator._parse_step(step)
+                    if token_name is None or content is None:
+                        continue
+                    if placeholder_re.match(content.strip()):
+                        continue
+                    if len(content.strip()) < 3:
+                        continue
+
+                filtered.append(step)
+
+            if not filtered:
+                continue
+
+            cleaned.append({
                 "question": item.get('question', ''),
                 "answer": item.get('answer', ''),
-                "cot_steps": processed_steps,
+                "cot_steps": filtered,
                 "split": item.get('split', split)
             })
-        
-        logger.info(f"Filtered {len(results)} -> {len(cleaned_data)} examples")
-        return cleaned_data
+
+        return cleaned
     
     def format_question_and_answer(self, example: Dict) -> Tuple[str, str]:
         return self._format_question_and_answer_internal(example)
@@ -1716,13 +1663,13 @@ class DatasetGenerator:
         backend = self.cot_generator.config.get('generator', {}).get('backend', 'api')
         output_file = self.get_output_filename(split)
         results = []
-        
+
         data_list = list(data)
         if num_examples and len(data_list) > num_examples:
             indices = random.sample(range(len(data_list)), num_examples)
             data_list = [data_list[i] for i in indices]
             logger.info(f"Sampled {num_examples} examples for {split} split")
-        
+
         if split == "test":
             logger.info(f"Generating test data without CoT steps")
             for i, example in enumerate(tqdm(data_list, desc=f"Processing {self.dataset_name} {split}")):
@@ -1734,7 +1681,6 @@ class DatasetGenerator:
                         "cot_steps": [],
                         "split": split
                     })
-                    
                     if self.incremental_save and (i + 1) % self.incremental_save_interval == 0:
                         self.save_results(results, output_file)
                 except Exception as e:
@@ -1742,7 +1688,7 @@ class DatasetGenerator:
                     continue
         else:
             use_batch = self._should_use_batch_processing(split, backend)
-            
+
             if use_batch:
                 logger.info(f"Using batch processing with batch_size={self.batch_size}")
                 for i in range(0, len(data_list), self.batch_size):
@@ -1750,11 +1696,12 @@ class DatasetGenerator:
                     batch_num = i // self.batch_size + 1
                     total_batches = (len(data_list) + self.batch_size - 1) // self.batch_size
                     logger.info(f"Processing batch {batch_num}/{total_batches}")
-                    
+
                     try:
                         batch_results = self.process_batch(batch_data, split)
-                        results.extend(batch_results)
-                        
+                        for res in batch_results:
+                            if res.get('cot_steps'):
+                                results.append(res)
                         if self.incremental_save and (i + 1) % self.incremental_save_interval == 0:
                             self.save_results(results, output_file)
                     except Exception as e:
@@ -1762,7 +1709,8 @@ class DatasetGenerator:
                         for example in batch_data:
                             try:
                                 processed = self.process_example(example, split)
-                                results.append(processed)
+                                if processed.get('cot_steps'):
+                                    results.append(processed)
                             except Exception as e2:
                                 logger.warning(f"Failed to process individual example: {e2}")
                                 continue
@@ -1771,22 +1719,22 @@ class DatasetGenerator:
                 for i, example in enumerate(tqdm(data_list, desc=f"Processing {self.dataset_name} {split}")):
                     try:
                         processed = self.process_example(example, split)
-                        results.append(processed)
-                        
+                        if processed.get('cot_steps'):
+                            results.append(processed)
                         if self.incremental_save and (i + 1) % self.incremental_save_interval == 0:
                             self.save_results(results, output_file)
                     except Exception as e:
                         logger.warning(f"Failed to process example {i}: {e}")
                         continue
-        
+
         self.save_results(results, output_file)
-        
+
         if self.filter_output and split != "test":
             logger.info(f"Filtering {split} results")
             results = self.filter_results(results, split)
             output_file = self.get_output_filename(split)
             self.save_results(results, output_file)
-        
+
         logger.info(f"Generated {len(results)} examples for {self.dataset_name} {split}")
         return results
     
@@ -1806,7 +1754,9 @@ def main(args):
         logger.warning(f"Config file not found: {e}")
         config = {'generator': {'api': {}, 'vllm': {}}}
     
-    config['debug'] = args.debug if args.debug is not None else False
+    if args.debug is not None:
+        config['debug'] = args.debug
+    
     generator_config = config.setdefault('generator', {})
     
     if args.backend is not None:

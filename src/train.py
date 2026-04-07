@@ -16,10 +16,17 @@ from fixed_length_dataset import make_fixed_length_data_module
 from transformers.utils import logging as transformers_logging
 from peft import LoraConfig, TaskType, prepare_model_for_kbit_training
 from config import (
-    COT_TOKENS, DEFAULT_TRAIN_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR,
+    COT_TOKENS, END_MARK, DEFAULT_TRAIN_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR,
     load_config, load_datasets_config, update_dataclass_from_config,
     setup_directories, logger, dataset_names
 )
+
+COT_TOKEN_NAMES = list(COT_TOKENS.keys())
+
+if END_MARK:
+    COT_TOKEN_LIST = [f"<{i}>" for i in COT_TOKEN_NAMES] + [f"</{i}>" for i in COT_TOKEN_NAMES]
+else:
+    COT_TOKEN_LIST = [f"<{i}>" for i in COT_TOKEN_NAMES]
 
 transformers_logging.set_verbosity_info()
 transformers_logging.enable_explicit_format()
@@ -173,19 +180,19 @@ def create_cot_tokens(
     if 'tag' not in config['common']['parameter_efficient_mode']:
         return []
     
-    logger.info(f"Defining CoT tokens: {COT_TOKENS}")
+    logger.info(f"Defining CoT tokens: {COT_TOKEN_LIST}")
     
     before_size = len(tokenizer)
     logger.info(f"Tokenizer vocabulary before adding CoT tokens: {before_size}")
 
-    num_new = tokenizer.add_tokens(COT_TOKENS)
-    cot_token_ids = tokenizer.convert_tokens_to_ids(COT_TOKENS)
+    num_new = tokenizer.add_tokens(COT_TOKEN_LIST)
+    cot_token_ids = tokenizer.convert_tokens_to_ids(COT_TOKEN_LIST)
 
     after_size = len(tokenizer)
     logger.info(f"Tokenizer vocabulary after adding CoT tokens: {after_size}")
     logger.debug(f"Added {num_new} new token(s) to tokenizer")
     
-    for token in COT_TOKENS:
+    for token in COT_TOKEN_LIST:
         token_id = tokenizer.convert_tokens_to_ids(token)
         logger.debug(f"Token '{token}' -> ID {token_id}")
     
