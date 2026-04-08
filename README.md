@@ -1,4 +1,4 @@
-# ReasonBench
+# LLMReasonBench
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -6,7 +6,7 @@ Benchmark and enhance reasoning capabilities in large language models (LLMs)
 
 ## 📖 Overview
 
-ReasonBench is an evaluation and training framework that measures and improves how well LLMs separate **memory recall** from **logical reasoning**. Based on the methodology from *[Disentangling Memory and Reasoning Ability in Large Language Models](https://github.com/MingyuJ666/Disentangling-Memory-and-Reasoning)*, this tool uses customizable special tokens to explicitly isolate these cognitive processes during inference.
+LLMReasonBench is an evaluation and training framework that measures and improves how well LLMs separate **memory recall** from **logical reasoning**. Based on the methodology from *[Disentangling Memory and Reasoning Ability in Large Language Models](https://github.com/MingyuJ666/Disentangling-Memory-and-Reasoning)*, this tool uses customizable special tokens to explicitly isolate these cognitive processes during inference.
 
 ## 🚀 Quick Start
 
@@ -15,8 +15,8 @@ ReasonBench is an evaluation and training framework that measures and improves h
 Clone the repository and run the installation script:
 
 ```bash
-git clone https://github.com/metalearningnet/ReasonBench.git
-cd ReasonBench
+git clone https://github.com/metalearningnet/LLMReasonBench.git
+cd LLMReasonBench
 ./install.sh
 ```
 
@@ -151,7 +151,7 @@ GENERATOR_MAP['my_dataset'] = MyDatasetGenerator
 DATASET_MAP['my_dataset'] = MyDataset
 ```
 
-Now you can use `--dataset my_dataset` with all ReasonBench commands.
+Now you can use `--dataset my_dataset` with all LLMReasonBench commands.
 
 ## ⚙️ Configuration
 
@@ -207,7 +207,7 @@ generator:
 
 ### Special Token Configuration
 
-`conf/tokens.py` defines the CoT tokens and their expected behavior. The following configuration is used throughout ReasonBench:
+`conf/tokens.py` defines the CoT tokens and their expected behavior. The following configuration is used throughout LLMReasonBench:
 
 ```python
 COT_TOKENS = {
@@ -228,7 +228,7 @@ END_MARK = True # True: <token> content </token> | False: <token>: content
 
 ### Chain‑of‑Thought (CoT) Format
 
-ReasonBench supports two output formats controlled by the `END_MARK` flag in `conf/tokens.py`:
+LLMReasonBench supports two output formats controlled by the `END_MARK` flag in `conf/tokens.py`:
 
 - **Colon format** (`END_MARK = False`):
   ```
@@ -244,4 +244,4 @@ ReasonBench supports two output formats controlled by the `END_MARK` flag in `co
 
 ## 📄 License
 
-This project is licensed under the MIT License – see the [LICENSE](https://github.com/metalearningnet/ReasonBench/blob/main/LICENSE) file for details.
+This project is licensed under the MIT License – see the [LICENSE](https://github.com/metalearningnet/LLMReasonBench/blob/main/LICENSE) file for details.
