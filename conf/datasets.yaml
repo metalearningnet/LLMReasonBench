@@ -106,3 +106,13 @@ aime25:
     question: "problem"
     answer: "answer"
   clean_latex: true
+
+alfworld:
+  name: "ALFWorld"
+  answer_type: "action_sequence"
+  task_source: "pick_and_place_simple"
+  max_steps: 50
+  interactive: true
+  output_format: "messages"
+  filter_success: true
+  use_butler_fallback: true

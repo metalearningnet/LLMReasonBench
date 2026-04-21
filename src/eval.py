@@ -17,15 +17,14 @@ from preprocess import DataConfig
 from train import create_cot_tokens
 from peft import PeftModel, PeftConfig
 from torch.utils.data import DataLoader
+from generator import format_trajectory
 from dataclasses import dataclass, field, asdict
 from peft_model import PeftModelForCausalLMWrapper
 from typing import Optional, Dict, List, Tuple, Any
 from config import (
-    COT_TOKENS, DEFAULT_EVAL_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR, MD_PATH, MD_SRC, RESERVED_MODELS,
+    COT_TOKEN_NAMES, DEFAULT_EVAL_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR, MD_PATH, MD_SRC, RESERVED_MODELS, SHOW_EVAL, SHOW_PROMPT, SHOW_TRAJECTORY_ON_FAIL,
     load_config, load_datasets_config, update_dataclass_from_config, setup_directories, dataset_names, logger
 )
-
-COT_TOKEN_NAMES = list(COT_TOKENS.keys())
 
 @dataclass
 class ModelArguments:
@@ -60,6 +59,10 @@ class ModelArguments:
     hf_hub_token: Optional[str] = field(
         default=None,
         metadata={"help": "Hugging Face token required for llama family models."}
+    )
+    interactive: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Use interactive environment evaluation for multi‑turn datasets (e.g., ALFWorld)."}
     )
     enable_cpu_offload: Optional[bool] = field(default=False)
     config: Optional[str] = field(
@@ -306,7 +309,7 @@ class ModelLoader:
             if input_embedding_file.exists() and output_embedding_file.exists():
                 return "custom_peft"
         
-        if model_args.parameter_efficient_mode and 'lora' in model_args.parameter_efficient_mode:
+        if os.path.isdir(model_name) and model_args.parameter_efficient_mode and 'lora' in model_args.parameter_efficient_mode:
             return "base_model_with_lora"
         
         return "standalone_model"
@@ -1088,7 +1091,7 @@ class BatchEvaluator:
         default_kwargs = {
             "max_new_tokens": max_new_tokens,
             "pad_token_id": model.config.pad_token_id if hasattr(model.config, 'pad_token_id') else None,
-            "eos_token_id": model.config.eos_token_id if hasattr(model.config, 'eos_token_id') else None,
+            "eos_token_id": model.config.eos_token_id if hasattr(model.config, 'eos_token_id') else None
         }
         
         if hasattr(model, 'generation_config') and model.generation_config is not None:
@@ -1428,55 +1431,297 @@ class ResultSaver:
             logger.warning(f"Could not save RL-specific info: {e}")
             return None
 
+def is_multiturn_dataset(dataset) -> bool:
+    if hasattr(dataset, 'output_format') and dataset.output_format == 'messages':
+        return True
+
+    if len(dataset) > 0:
+        sample = dataset[0]
+        if isinstance(sample, dict) and 'messages' in sample:
+            return True
+    return False
+
+def evaluate_multiturn(
+    model: torch.nn.Module,
+    tokenizer: transformers.PreTrainedTokenizer,
+    dataset: torch.utils.data.Dataset,
+    model_args: ModelArguments,
+    generation_kwargs: Dict[str, Any]
+) -> Tuple[int, int, List[Dict]]:
+    total_correct = 0
+    total_examples = len(dataset)
+    all_outputs = []
+
+    generation_kwargs.setdefault('max_new_tokens', 128)
+
+    for idx in tqdm(range(total_examples), desc="Evaluating multi‑turn"):
+        sample = dataset[idx]
+        messages = sample["messages"]
+
+        context_messages = messages[:-1]
+        ground_truth = messages[-1]["content"]
+
+        try:
+            input_text = tokenizer.apply_chat_template(
+                context_messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        except Exception as e:
+            logger.warning(f"Failed to apply chat template for sample {idx}: {e}")
+            input_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in context_messages])
+            input_text += "\nassistant: "
+
+        inputs = tokenizer(
+            input_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=model_args.max_length
+        ).to(model.device)
+
+        with torch.no_grad():
+            outputs = model.generate(**inputs, **generation_kwargs)
+
+        generated = tokenizer.decode(
+            outputs[0][inputs.input_ids.shape[1]:],
+            skip_special_tokens=True
+        )
+
+        cleaned = BatchEvaluator._clean_generated_texts([generated], dataset)[0]
+
+        if SHOW_EVAL:
+            logger.info(f"Sample {idx}:\n  Target: {ground_truth[:200]}\n  Generated: {cleaned[:200]}")
+
+        if hasattr(dataset, 'is_correct'):
+            is_correct = dataset.is_correct(cleaned, ground_truth)
+        else:
+            is_correct = cleaned.strip() == ground_truth.strip()
+
+        if is_correct:
+            total_correct += 1
+        else:
+            if SHOW_EVAL:
+                logger.info(f"Mismatch at sample {idx}: target and generated differ.")
+
+        all_outputs.append({
+            'input': input_text,
+            'target': ground_truth,
+            'generated_text': cleaned,
+            'result': 'correct' if is_correct else 'wrong'
+        })
+
+    return total_correct, total_examples, all_outputs
+
+def evaluate_interactive(
+    model: torch.nn.Module,
+    tokenizer: transformers.PreTrainedTokenizer,
+    dataset: torch.utils.data.Dataset,
+    model_args: ModelArguments,
+    generation_kwargs: Dict[str, Any]
+) -> Tuple[int, int, List[Dict]]:
+    total_success = 0
+    total_episodes = len(dataset)
+    all_outputs = []
+
+    max_steps = getattr(dataset, 'max_steps', 50)
+    generation_kwargs.setdefault('max_new_tokens', 128)
+
+    completion_prefixes = dataset.get_completion_action_prefixes()
+    logger.info(f"Using completion action prefixes: {completion_prefixes}")
+
+    for idx in tqdm(range(total_episodes), desc="Interactive evaluation"):
+        sample = dataset[idx]
+        task_id = sample.get("task_id", f"task_{idx}")
+        goal = sample.get("goal", "")
+        split = getattr(dataset, 'split', 'test')
+
+        try:
+            env = dataset.create_interactive_env(sample, split)
+            obs_list, info_dict = env.reset()
+            obs = obs_list[0]
+            info = {k: v[0] for k, v in info_dict.items()}
+        except Exception as e:
+            logger.error(f"Failed to initialize environment for task {task_id}: {e}")
+            all_outputs.append({
+                'task_id': task_id,
+                'success': False,
+                'error': str(e),
+                'steps': 0,
+                'history': [],
+                'input': f"Task {task_id}: {goal}",
+                'target': 'SUCCESS',
+                'generated_text': f"Environment initialization failed: {str(e)[:100]}",
+                'result': 'failure'
+            })
+            continue
+
+        done = False
+        step_count = 0
+        history = []
+        reward = 0
+
+        target_obj, target_rec = dataset.get_goal_components(goal)
+
+        while not done and step_count < max_steps:
+            raw_admissible = info.get("admissible_commands", [])
+            flat_commands = dataset.flatten_commands(raw_admissible)
+
+            if not flat_commands:
+                logger.warning(f"No admissible commands at step {step_count}. Breaking episode.")
+                break
+
+            if target_obj and target_rec and completion_prefixes:
+                placement_commands = [
+                    cmd for cmd in flat_commands
+                    if any(cmd.startswith(prefix) for prefix in completion_prefixes)
+                ]
+                for cmd in placement_commands:
+                    if target_obj.lower() in cmd.lower() and target_rec.lower() in cmd.lower():
+                        action = cmd
+                        logger.info(f"Auto-selected placement action: {action}")
+                        try:
+                            obs_list, reward_list, done_list, info_dict = env.step([action])
+                            obs = obs_list[0]
+                            reward = reward_list[0]
+                            done = done_list[0]
+                            info = {k: v[0] for k, v in info_dict.items()} if info_dict else {}
+                        except Exception as e:
+                            logger.error(f"Placement shortcut failed for task {task_id}: {e}")
+                            done = True
+                            break
+                        step_count += 1
+                        history.append({
+                            'observation': obs,
+                            'action': action,
+                            'admissible_commands': flat_commands.copy()
+                        })
+                        break
+                if done:
+                    break
+
+            prompt = dataset.build_prompt(obs, goal, flat_commands, history)
+
+            if SHOW_PROMPT:
+                logger.info(f"Prompt:\n{prompt}")
+
+            inputs = tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=model_args.max_length
+            ).to(model.device)
+
+            with torch.no_grad():
+                outputs = model.generate(**inputs, **generation_kwargs)
+
+            generated_text = tokenizer.decode(
+                outputs[0][inputs.input_ids.shape[1]:],
+                skip_special_tokens=True
+            )
+
+            action = dataset.parse_action(generated_text, flat_commands)
+            if action is None:
+                logger.debug(f"Failed to parse action from: {generated_text[:100]}")
+                if flat_commands:
+                    action = random.choice(flat_commands)
+                    logger.warning(f"Using random fallback action: {action}")
+                else:
+                    break
+
+            try:
+                obs_list, reward_list, done_list, info_dict = env.step([action])
+                obs = obs_list[0]
+                reward = reward_list[0]
+                done = done_list[0]
+                info = {k: v[0] for k, v in info_dict.items()}
+            except Exception as e:
+                logger.error(f"Environment step failed for task {task_id}: {e}")
+                break
+
+            history.append({
+                'observation': obs,
+                'action': action,
+                'admissible_commands': flat_commands.copy()
+            })
+            step_count += 1
+
+        success = (reward == 1)
+
+        if not success and hasattr(dataset, 'infer_success_from_obs'):
+            if dataset.infer_success_from_obs(obs):
+                success = True
+                logger.info(f"Task {task_id} inferred as successful from observation.")
+
+        if success:
+            total_success += 1
+        elif SHOW_TRAJECTORY_ON_FAIL:
+            logger.info(f"Failed trajectory for task {task_id}:\n{format_trajectory(history, goal)}")
+
+        all_outputs.append({
+            'task_id': task_id,
+            'goal': goal,
+            'success': success,
+            'steps': step_count,
+            'history': history,
+            'max_steps_reached': step_count >= max_steps and not done,
+            'input': goal,
+            'target': 'SUCCESS' if success else 'FAILURE',
+            'generated_text': f"Episode completed in {step_count} steps",
+            'result': 'success' if success else 'failure'
+        })
+
+        if hasattr(env, 'close'):
+            env.close()
+
+    return total_success, total_episodes, all_outputs
+
 def evaluate() -> float:
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments))
     model_args, data_args = parser.parse_args_into_dataclasses()
-    
+
     if model_args.model is None:
         logger.error("--model is required for evaluation")
         raise ValueError("model is required")
-    
+
     if data_args.dataset is None:
         logger.error("--dataset is required for evaluation")
         raise ValueError("dataset is required")
-    
+
     try:
         config = load_config(model_args.config if hasattr(model_args, 'config') else None)
         logger.info("Configuration loaded successfully")
     except FileNotFoundError as e:
         logger.warning(f"Configuration file not found: {e}")
-        config = {
-            'eval': {}
-        }
+        config = {'eval': {}}
         logger.info("Using default configuration")
-    
+
     model_args = update_dataclass_from_config(model_args, config, ['common', 'eval'])
     data_args = update_dataclass_from_config(data_args, config, ['common', 'eval'])
 
     if not data_args.batch_size:
         data_args.batch_size = config['common']['batch_size']
-    
+
     setup_directories(config)
-    
+
     if model_args.output_dir is None:
         model_args.output_dir = str(DEFAULT_EVAL_OUTPUT_DIR)
         logger.info(f"Using default output directory: {model_args.output_dir}")
-    
+
     if model_args.hf_hub_token:
         try:
             login(token=model_args.hf_hub_token)
             logger.info("Logged in to Hugging Face Hub")
         except Exception as e:
             logger.warning(f"Failed to login to Hugging Face Hub: {e}")
-    
+
     model_name, input_embedding_file, output_embedding_file, checkpoint_dir = ModelPathResolver.resolve(model_args)
-    
+
     logger.info(f"Model path: {model_args.model}")
     logger.info(f"Resolved model name: {model_name}")
     logger.info(f"Checkpoint directory: {checkpoint_dir}")
-    
+
     is_trl_trained_model = False
-    
+
     if model_name in RESERVED_MODELS:
         logger.info(f"Loading reserved model: {model_name}")
         model = ModelLoader.load(model_args, model_name)
@@ -1489,24 +1734,21 @@ def evaluate() -> float:
                 (checkpoint_dir / "adapter_model.safetensors").exists() or
                 (checkpoint_dir / "adapter_model.bin").exists()
             )
-            
             if has_training_args and has_adapter_config and has_adapter_model:
                 is_trl_trained_model = True
                 logger.info("Detected RL-trained model (standard PEFT format)")
 
         tokenizer_path = str(checkpoint_dir) if checkpoint_dir and checkpoint_dir.exists() else model_name
         logger.info(f"Loading tokenizer from: {tokenizer_path}")
-        
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             tokenizer_path,
             trust_remote_code=True,
             padding_side="left"
         )
-        
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
             logger.info(f"Set pad_token to eos_token: {tokenizer.pad_token}")
-        
+
         cot_tokens = []
         num_new_tokens = 0
         if not is_trl_trained_model:
@@ -1514,7 +1756,6 @@ def evaluate() -> float:
                 cot_tokens = create_cot_tokens(config, tokenizer)
                 if cot_tokens:
                     logger.info(f"Created {len(cot_tokens)} CoT delimiters")
-                
                 from transformers import AutoConfig
                 orig_config = AutoConfig.from_pretrained(model_name)
                 orig_vocab_size = orig_config.vocab_size
@@ -1525,7 +1766,7 @@ def evaluate() -> float:
                 cot_tokens = []
         else:
             logger.info("CoT delimiters disabled")
-        
+
         logger.info("Loading model...")
         model = ModelLoader.load(
             model_args=model_args,
@@ -1535,7 +1776,7 @@ def evaluate() -> float:
             num_new_tokens=num_new_tokens,
             checkpoint_dir=checkpoint_dir
         )
-        
+
         logger.info("=" * 60)
         logger.info("MODEL CONFIGURATION SUMMARY")
         logger.info("=" * 60)
@@ -1544,17 +1785,17 @@ def evaluate() -> float:
         logger.info(f"Chain-of-Thought Delimiters: {num_new_tokens}")
         logger.info(f"Active Device: {next(model.parameters()).device}")
         logger.info("=" * 60)
-    
+
     model.eval()
     logger.info("Model set to evaluation mode")
-    
+
     try:
         data_class = DatasetManager.get_data_class(data_args.dataset)
         logger.info(f"Using dataset class: {data_class.__name__}")
     except ValueError as e:
         logger.error(f"Dataset error: {e}")
         raise
-    
+
     data_config = DataConfig()
     try:
         datasets_config = load_datasets_config()
@@ -1562,7 +1803,7 @@ def evaluate() -> float:
     except Exception as e:
         logger.warning(f"Failed to load dataset config: {e}")
         data_config.dataset = {}
-    
+
     logger.info(f"Loading dataset: {data_args.dataset}")
     try:
         dataset = DatasetManager.create_dataset(
@@ -1575,24 +1816,15 @@ def evaluate() -> float:
     except Exception as e:
         logger.error(f"Failed to load dataset: {e}")
         raise
-    
+
     if data_args.num_test and len(dataset) > data_args.num_test:
         logger.info(f"Sampling {data_args.num_test} examples from dataset")
         dataset = DatasetManager.sample_dataset(
             dataset, data_args.num_test, data_args.seed
         )
         logger.info(f"Sampled dataset has {len(dataset)} examples")
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=data_args.batch_size,
-        shuffle=False,
-        num_workers=0
-    )
-    logger.info(f"Created dataloader with batch size {data_args.batch_size}")
-    
+
     generation_kwargs = {}
-    
     if model_args.temperature is not None:
         generation_kwargs["temperature"] = model_args.temperature
     if model_args.top_p is not None:
@@ -1603,7 +1835,7 @@ def evaluate() -> float:
         generation_kwargs["num_beams"] = model_args.num_beams
     if model_args.do_sample is not None:
         generation_kwargs["do_sample"] = model_args.do_sample
-    
+
     if model_args.generation_config:
         try:
             if Path(model_args.generation_config).exists():
@@ -1617,56 +1849,81 @@ def evaluate() -> float:
                 logger.info("Loaded generation config from JSON string")
         except Exception as e:
             logger.warning(f"Failed to load generation config: {e}")
-    
+
     if generation_kwargs:
         logger.info("Generation configuration:")
         for key, value in generation_kwargs.items():
             logger.info(f"  {key}: {value}")
-    
-    total_correct = 0
-    total_examples = 0
-    all_outputs = []
-    
-    logger.info(f"Evaluating {len(dataset)} examples in batches of {data_args.batch_size}...")
-    
-    with tqdm(dataloader, desc="Evaluation", unit="batch") as progress_bar:
-        for batch_idx, batch in enumerate(progress_bar):
-            x_text, y_text = batch['x'], batch['y']
-            
-            try:
-                batch_correct, batch_size, batch_outputs = BatchEvaluator.evaluate(
-                    model=model,
-                    model_name=model_name,
-                    tokenizer=tokenizer,
-                    x_text=x_text,
-                    y_text=y_text,
-                    dataset=dataset,
-                    max_length=model_args.max_length,
-                    decoding_scheme=model_args.decoding_scheme,
-                    generation_kwargs=generation_kwargs
-                )
-            except Exception as e:
-                logger.error(f"Error evaluating batch {batch_idx}: {e}")
-                continue
-            
-            total_correct += batch_correct
-            total_examples += batch_size
-            all_outputs.extend(batch_outputs)
-            
-            current_accuracy = total_correct / total_examples if total_examples > 0 else 0
-            progress_bar.set_postfix({
-                'accuracy': f'{current_accuracy:.4f}',
-                'correct': f'{total_correct}/{total_examples}'
-            })
-    
+
+    if is_multiturn_dataset(dataset):
+        if model_args.interactive:
+            logger.info("Using interactive environment evaluation (multi‑turn)")
+            total_correct, total_examples, all_outputs = evaluate_interactive(
+                model=model,
+                tokenizer=tokenizer,
+                dataset=dataset,
+                model_args=model_args,
+                generation_kwargs=generation_kwargs,
+            )
+        else:
+            logger.info("Using offline multi‑turn evaluation")
+            total_correct, total_examples, all_outputs = evaluate_multiturn(
+                model=model,
+                tokenizer=tokenizer,
+                dataset=dataset,
+                model_args=model_args,
+                generation_kwargs=generation_kwargs,
+            )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=data_args.batch_size,
+            shuffle=False,
+            num_workers=0
+        )
+        logger.info(f"Created dataloader with batch size {data_args.batch_size}")
+
+        total_correct = 0
+        total_examples = 0
+        all_outputs = []
+
+        with tqdm(dataloader, desc="Evaluation", unit="batch") as progress_bar:
+            for batch_idx, batch in enumerate(progress_bar):
+                x_text, y_text = batch['x'], batch['y']
+                try:
+                    batch_correct, batch_size, batch_outputs = BatchEvaluator.evaluate(
+                        model=model,
+                        model_name=model_name,
+                        tokenizer=tokenizer,
+                        x_text=x_text,
+                        y_text=y_text,
+                        dataset=dataset,
+                        max_length=model_args.max_length,
+                        decoding_scheme=model_args.decoding_scheme,
+                        generation_kwargs=generation_kwargs
+                    )
+                except Exception as e:
+                    logger.error(f"Error evaluating batch {batch_idx}: {e}")
+                    continue
+
+                total_correct += batch_correct
+                total_examples += batch_size
+                all_outputs.extend(batch_outputs)
+
+                current_accuracy = total_correct / total_examples if total_examples > 0 else 0
+                progress_bar.set_postfix({
+                    'accuracy': f'{current_accuracy:.4f}',
+                    'correct': f'{total_correct}/{total_examples}'
+                })
+
     final_accuracy = total_correct / total_examples if total_examples > 0 else 0
-    
+
     logger.info(f"Model type: {'TRL-trained PEFT' if is_trl_trained_model else 'Standard model'}")
     logger.info(f"Total examples evaluated: {total_examples}")
-    logger.info(f"Correct predictions: {total_correct}")
-    logger.info(f"Incorrect predictions: {total_examples - total_correct}")
-    logger.info(f"Final accuracy: {final_accuracy:.4f} ({final_accuracy*100:.2f}%)")
-    
+    logger.info(f"Correct predictions / Successes: {total_correct}")
+    logger.info(f"Incorrect predictions / Failures: {total_examples - total_correct}")
+    logger.info(f"Final accuracy / Success rate: {final_accuracy:.4f} ({final_accuracy*100:.2f}%)")
+
     if model_args.save_result:
         try:
             config['model_info'] = {
@@ -1674,7 +1931,6 @@ def evaluate() -> float:
                 'model_type': type(model).__name__,
                 'checkpoint_dir': str(checkpoint_dir) if checkpoint_dir else None
             }
-            
             ResultSaver.save(
                 model_args, data_args, all_outputs,
                 total_correct, total_examples,
@@ -1684,7 +1940,7 @@ def evaluate() -> float:
             logger.error(f"Failed to save results: {e}")
     else:
         logger.info("Results saving disabled (save_result=False)")
-    
+
     return final_accuracy
 
 def evaluate_rl_checkpoint(checkpoint_path: str, dataset_name: str, **kwargs) -> float:

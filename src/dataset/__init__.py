@@ -3,6 +3,7 @@ from .gsm8k import GSM8KGenerator, GSM8K
 from .aime24 import AIME24Generator, AIME24
 from .aime25 import AIME25Generator, AIME25
 from .mmlupro import MMLUProGenerator, MMLUPro
+from .alfworld import AlfworldGenerator, Alfworld
 from .strategyqa import StrategyQAGenerator, StrategyQA
 from .truthfulqa import TruthfulQAGenerator, TruthfulQA
 from .metamathqa import MetaMathQAGenerator, MetaMathQA
@@ -14,6 +15,7 @@ GENERATOR_MAP = {
     'aime24': AIME24Generator,
     'aime25': AIME25Generator,
     'mmlupro': MMLUProGenerator,
+    'alfworld': AlfworldGenerator,
     'strategyqa': StrategyQAGenerator,
     'truthfulqa': TruthfulQAGenerator,
     'metamathqa': MetaMathQAGenerator,
@@ -26,6 +28,7 @@ DATASET_MAP = {
     'aime24': AIME24,
     'aime25': AIME25,
     'mmlupro': MMLUPro,
+    'alfworld': Alfworld,
     'strategyqa': StrategyQA,
     'truthfulqa': TruthfulQA,
     'metamathqa': MetaMathQA,

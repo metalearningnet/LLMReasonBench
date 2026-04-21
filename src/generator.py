@@ -1,4 +1,6 @@
 import re
+import os
+import sys
 import time
 import json
 import random
@@ -6,20 +8,31 @@ import openai
 import logging
 from tqdm import tqdm
 from pathlib import Path
+from abc import ABC, abstractmethod
 from vllm import LLM, SamplingParams
 from dataclasses import dataclass, field
 from transformers import HfArgumentParser
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple, Set, Callable
 from config import (
-    CHOICE_MAP, DEFAULT_DATA_DIR, LLM_API_BASE, LLM_API_MODEL, COT_TOKENS, END_MARK,
+    CHOICE_MAP, DEFAULT_DATA_DIR, LLM_API_BASE, LLM_API_MODEL, COT_TOKEN_NAMES,
+    COT_TOKENS, END_MARK, ENABLE_THINKING, SHOW_TRAJECTORY_ON_FAIL, SHOW_PROMPT, SHOW_RESPONSE, SHOW_ACTION,
     load_config, load_datasets_config, logger, dataset_names
 )
 
-COT_TOKEN_NAMES = list(COT_TOKENS.keys())
-ENABLE_THINKING = False
-
 for logger_name in ["openai", "httpx", "httpcore", "urllib3"]:
     logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+def format_trajectory(steps: List[Dict[str, Any]], goal: str) -> str:
+    lines = [f"Goal: {goal}\n"]
+    for i, step in enumerate(steps):
+        obs = step["observation"]
+        if len(obs) > 200:
+            obs = obs[:200] + "..."
+        lines.append(f"Step {i+1}:")
+        lines.append(f"  Obs: {obs}")
+        lines.append(f"  Action: {step['action']}")
+        lines.append(f"  Admissible: {step['admissible_commands'][:5]}..." if len(step['admissible_commands']) > 5 else f"  Admissible: {step['admissible_commands']}")
+    return "\n".join(lines)
 
 @dataclass
 class GeneratorArguments:
@@ -327,10 +340,12 @@ class VLLMClient(BaseLLMClient):
         try:
             formatted_prompts = [self._format_prompt(p) for p in prompts]
             
+            gen_max_tokens = max_tokens or self.config['train'].get('max_completion_length', 2048)
+
             sampling_params = SamplingParams(
                 temperature=self.temperature,
                 top_p=self.top_p,
-                max_tokens=max_tokens or self.max_tokens,
+                max_tokens=gen_max_tokens,
                 stop=self.stop_sequences,
                 frequency_penalty=self.frequency_penalty,
                 presence_penalty=self.presence_penalty,
@@ -341,22 +356,26 @@ class VLLMClient(BaseLLMClient):
             for i in range(0, len(formatted_prompts), self.batch_size):
                 batch_prompts = formatted_prompts[i:i + self.batch_size]
                 
-                outputs = self.llm.generate(batch_prompts, sampling_params)
-                
-                for output in outputs:
-                    generated_text = output.outputs[0].text.strip()
-                    all_responses.append(generated_text)
-                    completion_tokens = len(output.outputs[0].token_ids) if hasattr(output.outputs[0], 'token_ids') else 0
+                try:
+                    outputs = self.llm.generate(batch_prompts, sampling_params)
                     
-                    self.total_output_tokens += completion_tokens
-                    self.total_requests += 1
+                    for output in outputs:
+                        generated_text = output.outputs[0].text.strip()
+                        all_responses.append(generated_text)
+                        completion_tokens = len(output.outputs[0].token_ids) if hasattr(output.outputs[0], 'token_ids') else 0
+                        
+                        self.total_output_tokens += completion_tokens
+                        self.total_requests += 1
+                except Exception as batch_e:
+                    logger.error(f"vLLM batch generation failed: {batch_e}")
+                    all_responses.extend([""] * len(batch_prompts))
                 
                 logger.debug(f"Generated batch {i//self.batch_size + 1}/{(len(formatted_prompts)-1)//self.batch_size + 1}")
             
             return all_responses
         except Exception as e:
             logger.error(f"vLLM generation failed: {e}")
-            raise
+            return [""] * len(prompts)
 
 class LLMClientFactory:
     @staticmethod
@@ -980,9 +999,16 @@ class DatasetGenerator:
     ANSWER_TYPE_NUMERIC = "numeric"
     ANSWER_TYPE_OPEN_ENDED = "open_ended"
     
-    def __init__(self, cot_generator, config: Dict[str, Any], dataset_name: str):
+    def __init__(
+        self,
+        cot_generator: CoTGenerator,
+        config: Dict[str, Any],
+        args: Optional[GeneratorArguments]
+    ):
+        dataset_name = args.dataset
         datasets_config = load_datasets_config()
 
+        self.args = args
         self.config = config
         self.dataset_name = dataset_name
         self.cot_generator = cot_generator
@@ -1747,6 +1773,257 @@ class DatasetGenerator:
         
         return self._generate_for_split(data, split, num_examples)
 
+class InteractiveGenerator(ABC):
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        dataset_config: Dict[str, Any],
+        args: Optional[GeneratorArguments],
+        show_action=SHOW_ACTION,
+        show_prompt=SHOW_PROMPT,
+        show_response=SHOW_RESPONSE,
+        show_trajectory_on_fail=SHOW_TRAJECTORY_ON_FAIL
+    ):
+        self.config = config
+        self.dataset_config = dataset_config
+        self.args = args
+        self.dataset_name = args.dataset
+        self.mode = args.mode if args else 'train'
+        self.show_action = show_action
+        self.show_prompt = show_prompt
+        self.show_response = show_response
+        self.show_trajectory_on_fail = show_trajectory_on_fail
+
+        self.task_source = dataset_config.get("task_source", "put_two")
+        self.output_dir = Path(dataset_config.get("output_dir", DEFAULT_DATA_DIR))
+        self.max_steps = dataset_config.get("max_steps", 50)
+        self.output_format = dataset_config.get("output_format", "messages")
+        self.filter_success = dataset_config.get("filter_success", True)
+        self.fallback_policy: Optional[Callable] = None
+
+        peft_mode = config.get('common', {}).get('parameter_efficient_mode', '')
+        self.use_cot_tokens = peft_mode in ('lora-cog-frozen', 'lora-cog-tuned')
+        if self.use_cot_tokens:
+            logger.info("CoT token formatting enabled for ALFWorld prompts")
+        else:
+            logger.info("CoT token formatting disabled for ALFWorld prompts")
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        backend = args.backend if args and args.backend else config.get('generator', {}).get('backend', 'api')
+        self.llm_client = LLMClientFactory.create_client(config, backend)
+
+        logger.info(
+            f"Initialized {self.__class__.__name__} with backend: {backend}, "
+            f"output_format: {self.output_format}, filter_success: {self.filter_success}, "
+            f"task_source: {self.task_source}"
+        )
+
+    def get_output_filename(self, split: str) -> Path:
+        if self.dataset_name:
+            base_name = f"{self.dataset_name}_{split}"
+        else:
+            dataset_name = self.__class__.__name__.replace('Generator', '')
+            base_name = f"{dataset_name}_{split}"
+        
+        base_name = base_name.lower()
+        
+        return self.output_dir / f"{base_name}.json"
+
+    @abstractmethod
+    def setup_environment(self, task: Dict[str, Any], split: Optional[str] = None) -> Any:
+        pass
+
+    def load_builtin_tasks(self) -> List[Dict[str, Any]]:
+        raise NotImplementedError(
+            f"Task source '{self.task_source}' is not a file. "
+            f"{self.__class__.__name__} must override load_builtin_tasks()."
+        )
+
+    def enrich_metadata(self, result: Dict[str, Any], episode_state: Dict[str, Any]) -> None:
+        pass
+
+    def get_expert_action(
+        self,
+        observation: str,
+        goal: str,
+        admissible_commands: List[str],
+        history: List[Dict[str, str]]
+    ) -> str:
+        return self.get_action_with_fallback(
+            observation=observation,
+            goal=goal,
+            admissible_commands=admissible_commands,
+            history=history,
+            fallback_policy=self.fallback_policy
+        )
+
+    def run_episode(self, task: Dict[str, Any], split: Optional[str] = None) -> Dict[str, Any]:
+        pass
+
+    def convert_trajectory_to_messages(self, steps: List[Dict[str, Any]], goal: str) -> List[Dict[str, str]]:
+        messages = []
+        for i, step in enumerate(steps):
+            user_content = step["observation"]
+            if i == 0:
+                user_content = f"Goal: {goal}\n\nObservation: {user_content}"
+            messages.append({"role": "user", "content": user_content})
+            messages.append({"role": "assistant", "content": step["action"]})
+        return messages
+
+    def build_react_prompt(
+        self,
+        observation: str,
+        goal: str,
+        admissible_commands: List[str],
+        history: List[Dict[str, str]],
+        few_shot_example: str = ""
+    ) -> str:
+        truncated = history[-3:] if len(history) > 3 else history
+        history_str = ""
+        for turn in truncated:
+            history_str += f"Observation: {turn['observation']}\nAct: {turn['action']}\n\n"
+
+        admissible_str = "\n".join(f"- {cmd}" for cmd in admissible_commands[:10])
+
+        prompt = f"""You are an AI assistant playing a text-based game. Your goal is to complete a task.
+
+You must reason step-by-step, then output a precise action. Format:
+Think: [Your reasoning]
+Act: [Your chosen action]
+
+{few_shot_example}
+
+Goal: {goal}
+
+{history_str}
+Current observation: {observation}
+
+Available commands:
+{admissible_str}
+
+Think:"""
+        return prompt
+
+    def parse_action_from_response(self, response: str, admissible_commands: List[str]) -> Optional[str]:
+        lines = response.split("\n")
+        action = None
+        for line in reversed(lines):
+            if line.strip().startswith("Act:"):
+                action = line.replace("Act:", "").strip()
+                break
+        if action is None:
+            non_empty = [l.strip() for l in lines if l.strip()]
+            if non_empty:
+                action = non_empty[-1]
+        if action and action in admissible_commands:
+            return action
+        return None
+
+    def get_action_with_fallback(
+        self,
+        observation: str,
+        goal: str,
+        admissible_commands: List[str],
+        history: List[Dict[str, str]],
+        fallback_policy: Optional[Callable] = None
+    ) -> str:
+        try:
+            prompt = self.build_react_prompt(observation, goal, admissible_commands, history)
+            if self.show_prompt:
+                logger.info(f"Prompt: {prompt}")
+            response = self.llm_client.get_response(prompt)
+            if self.show_response:
+                logger.info(f"Response: {response}")
+            action = self.parse_action_from_response(response, admissible_commands)
+            if self.show_action:
+                logger.info(f"Action: {action}")
+            if action:
+                return action
+        except Exception as e:
+            if "maximum context length" in str(e) or "input tokens" in str(e):
+                logger.warning(f"Context length exceeded. Falling back")
+            else:
+                logger.warning(f"LLM expert failed: {e}")
+
+        if fallback_policy:
+            logger.info("Using fallback policy")
+            try:
+                action = fallback_policy(observation, goal, admissible_commands, history)
+                if action and action in admissible_commands:
+                    return action
+            except Exception as e:
+                logger.warning(f"Fallback policy failed: {e}")
+
+        if admissible_commands:
+            action = random.choice(admissible_commands)
+            logger.warning(f"No valid action from LLM or fallback; using random action: {action}")
+            return action
+
+        raise RuntimeError("No admissible commands available and all experts failed")
+
+    def load_tasks(self, num_tasks: Optional[int] = None) -> List[Dict[str, Any]]:
+        if os.path.exists(self.task_source):
+            with open(self.task_source, "r", encoding="utf-8") as f:
+                tasks = json.load(f)
+            if not isinstance(tasks, list):
+                raise ValueError("Task JSON file must contain a list of task objects")
+            if num_tasks is not None and num_tasks < len(tasks):
+                tasks = tasks[:num_tasks]
+            for idx, task in enumerate(tasks):
+                if "id" not in task:
+                    task["id"] = f"{self.__class__.__name__}_task_{idx}"
+            logger.info(f"Loaded {len(tasks)} tasks from JSON file: {self.task_source}")
+            return tasks
+        else:
+            tasks = self.load_builtin_tasks()
+            if num_tasks is not None and num_tasks < len(tasks):
+                tasks = tasks[:num_tasks]
+            return tasks
+
+    def save_trajectories(self, trajectories: List[Dict[str, Any]], output_filename: str) -> None:
+        with open(output_filename, "w", encoding="utf-8") as f:
+            json.dump(trajectories, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved {len(trajectories)} trajectories to {output_filename}")
+
+    def generate(self, split: str, num_examples: Optional[int] = None) -> List[Dict]:
+        output_filename = self.get_output_filename(split)
+        tasks = self.load_tasks(num_tasks=num_examples)
+        logger.info(f"Generating trajectories for {len(tasks)} tasks")
+
+        all_results = []
+        successful_episodes = 0
+        for idx, task in enumerate(tasks):
+            task_id = task.get("id", f"task_{idx}")
+            goal = task.get("goal", "No goal")
+            logger.info(f"Task {idx+1}/{len(tasks)} (ID: {task_id}): {goal[:60]}...")
+            try:
+                result = self.run_episode(task, split=split)
+                result.setdefault("task_id", task_id)
+                result.setdefault("goal", goal)
+                all_results.append(result)
+                if result["success"]:
+                    successful_episodes += 1
+                    logger.info(f"  Success in {result['total_steps']} steps")
+                else:
+                    logger.warning(f"  Failed after {result['total_steps']} steps")
+            except Exception as e:
+                logger.error(f"  Error: {e}", exc_info=True)
+                all_results.append({
+                    "task_id": task_id, "goal": goal,
+                    "success": False, "total_steps": 0,
+                    "error": str(e)
+                })
+
+        if self.filter_success:
+            trajectories = [r for r in all_results if r.get("success", False)]
+            logger.info(f"Filtered trajectories: kept {len(trajectories)}/{len(all_results)} successful episodes")
+        else:
+            trajectories = all_results
+
+        self.save_trajectories(trajectories, output_filename)
+        logger.info(f"Generation complete. Success rate: {successful_episodes}/{len(tasks)} ({successful_episodes/len(tasks)*100:.1f}%)")
+
 def main(args):
     try:
         config = load_config(args.config)
@@ -1758,7 +2035,7 @@ def main(args):
         config['debug'] = args.debug
     
     generator_config = config.setdefault('generator', {})
-    
+
     if args.backend is not None:
         backend = args.backend
         generator_config['backend'] = backend
@@ -1770,7 +2047,7 @@ def main(args):
         backend = "api"
         generator_config['backend'] = backend
         logger.info(f"Using default backend: {backend}")
-    
+
     if backend == 'api':
         llm_config = generator_config.setdefault('api', {})
     else:
@@ -1785,13 +2062,10 @@ def main(args):
     if backend == 'api':
         if args.api_key:
             llm_config['api_key'] = args.api_key
-        
         if args.api_base:
             llm_config['api_base'] = args.api_base
-        
         if args.model:
             llm_config['model'] = args.model
-        
         if 'model' not in llm_config or not llm_config['model']:
             llm_config['model'] = LLM_API_MODEL
     elif backend == 'vllm':
@@ -1822,62 +2096,60 @@ def main(args):
     
     if args.dry_run:
         config['dry_run'] = True
-    
-    try:
-        cot_gen = CoTGenerator(config, backend)
-        logger.info(f"✓ LLM service configured with backend: {backend}")
-        
-        if backend == 'api':
-            logger.info(f"  API Base: {llm_config.get('api_base')}")
-            logger.info(f"  Model: {llm_config.get('model')}")
-        else:
-            logger.info(f"  Model Path: {llm_config.get('model', 'Not specified')}")
-            logger.info(f"  Batch Size: {llm_config.get('batch_size')}")
-            logger.info(f"  GPU Memory Utilization: {llm_config.get('gpu_memory_utilization')}")
-            logger.info(f"  Tensor Parallel Size: {llm_config.get('tensor_parallel_size')}")
-        
-        logger.info(f"  Temperature: {generator_config.get('temperature')}")
-    except Exception as e:
-        logger.error(f"Error initializing LLM client: {e}")
-        logger.info("Please check your configuration")
+        logger.info("Dry run completed - configuration is valid")
         return
-    
-    if args.dry_run:
-        logger.info("✓ Dry run completed - configuration is valid")
-        return
-    
-    from dataset import GENERATOR_MAP
 
+    datasets_config = load_datasets_config()
+    if args.dataset not in datasets_config:
+        logger.error(f"Dataset '{args.dataset}' not found in datasets.yaml")
+        return
+    dataset_config = datasets_config[args.dataset]
+
+    from dataset import GENERATOR_MAP
     if args.dataset not in GENERATOR_MAP:
         raise ValueError(f"Unknown dataset: {args.dataset}. Available: {list(GENERATOR_MAP.keys())}")
-    
+
+    is_interactive = dataset_config.get('interactive', False)
+
     logger.info(f"{'='*60}")
     logger.info(f"DATA GENERATION")
     logger.info(f"{'='*60}")
     logger.info(f"Dataset: {args.dataset}")
     logger.info(f"Backend: {backend}")
-    
+    logger.info(f"Split: {args.mode}")
     if backend == 'api':
         logger.info(f"API Service: {llm_config.get('api_base')}")
         logger.info(f"Model: {llm_config.get('model')}")
     else:
         logger.info(f"Model: {llm_config.get('model', 'Not specified')}")
         logger.info(f"Batch Size: {llm_config.get('batch_size')}")
-    
-    num_examples = args.num_examples
-
-    logger.info(f"Mode: {args.mode}")
-    logger.info(f"Examples: {num_examples or 'all'}")
+    logger.info(f"Interactive: {is_interactive}")
+    if not is_interactive:
+        logger.info(f"Mode: {args.mode}")
+        logger.info(f"Examples: {args.num_examples or 'all'}")
+    else:
+        logger.info(f"Task Source: {dataset_config.get('task_source', 'unknown')}")
+        logger.info(f"Max Steps: {dataset_config.get('max_steps', 50)}")
+        logger.info(f"Output Format: {dataset_config.get('output_format', 'messages')}")
     logger.info(f"{'='*60}")
-    
-    generator = GENERATOR_MAP[args.dataset](cot_gen, config, args.dataset)
-    results = generator.generate(args.mode, num_examples)
-    
-    if args.mode == 'train':
-        cot_gen.llm_client.print_summary()
-    
-    logger.info(f"Generation Complete!")
-    logger.info(f"Generated {len(results)} examples for {args.dataset} ({args.mode})")
+
+    if is_interactive:
+        original_argv = sys.argv
+        sys.argv = [original_argv[0]]
+        try:
+            generator = GENERATOR_MAP[args.dataset](config, dataset_config, args)
+            generator.generate(args.mode, args.num_examples)
+        finally:
+            sys.argv = original_argv
+        logger.info(f"Generation Complete for {args.dataset} ({args.mode})")
+    else:
+        cot_gen = CoTGenerator(config, backend)
+        logger.info(f"✓ LLM service configured with backend: {backend}")
+        generator = GENERATOR_MAP[args.dataset](cot_gen, config, args)
+        results = generator.generate(args.mode, args.num_examples)
+        if args.mode == 'train':
+            cot_gen.llm_client.print_summary()
+        logger.info(f"Generation Complete! Generated {len(results)} examples for {args.dataset} ({args.mode})")
 
 if __name__ == '__main__':
     parser = HfArgumentParser(GeneratorArguments)

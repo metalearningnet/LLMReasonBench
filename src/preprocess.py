@@ -1,6 +1,7 @@
 import re
 import os
 import json
+from pathlib import Path
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from torch.utils.data import Dataset
@@ -59,6 +60,12 @@ class MultipleChoiceNormalizer(AnswerNormalizer):
         
         logger.debug(f"Could not normalize answer: '{answer}'")
         return None
+
+class IdentityNormalizer(AnswerNormalizer):
+    def normalize(self, answer: Any) -> Optional[str]:
+        if answer is None:
+            return None
+        return str(answer)
 
 class BooleanAnswerNormalizer(AnswerNormalizer):
     def normalize(self, answer: Any) -> Optional[str]:
@@ -394,6 +401,12 @@ class EnhancedNumericExtractor(AnswerExtractor):
         
         return self.invalid_ans
 
+class IdentityExtractor(AnswerExtractor):
+    def extract(self, completion: str) -> str:
+        if completion is None:
+            return self.invalid_ans
+        return completion.strip()
+
 @dataclass
 class DataConfig:
     invalid_ans: str = INVALID_ANS
@@ -407,6 +420,7 @@ class BaseData(Dataset, ABC):
     ANSWER_TYPE_MULTIPLE_CHOICE = "multiple_choice"
     ANSWER_TYPE_BOOLEAN = "boolean"
     ANSWER_TYPE_NUMERIC = "numeric"
+    ANSWER_TYPE_ACTION_SEQUENCE = "action_sequence"
     ANSWER_TYPE_OPEN_ENDED = "open_ended"
     
     def __init__(self, name: str, split: str, config: DataConfig):
@@ -457,6 +471,9 @@ class BaseData(Dataset, ABC):
             else:
                 logger.warning(f"Multiple choice dataset has no valid answers, using default")
                 return MultipleChoiceNormalizer()
+        elif answer_type == self.ANSWER_TYPE_ACTION_SEQUENCE:
+            logger.debug("Selecting IdentityNormalizer for action_sequence")
+            return IdentityNormalizer()
         else:
             logger.warning(f"Unknown answer type, defaulting to MultipleChoiceNormalizer")
             return MultipleChoiceNormalizer()
@@ -483,6 +500,9 @@ class BaseData(Dataset, ABC):
             else:
                 logger.warning(f"Multiple choice dataset {self.__class__.__name__} has no valid answers specified")
                 return MultipleChoiceExtractor(invalid_ans=self.config.invalid_ans)
+        elif answer_type == self.ANSWER_TYPE_ACTION_SEQUENCE:
+            logger.info("Selecting IdentityExtractor for action_sequence dataset")
+            return IdentityExtractor(invalid_ans=self.config.invalid_ans)
         else:
             logger.warning(f"Unknown answer type '{answer_type}', defaulting to MultipleChoiceExtractor")
             return MultipleChoiceExtractor(invalid_ans=self.config.invalid_ans)
@@ -843,3 +863,45 @@ class JsonDataset(BaseData):
             error_msg = f"Failed to load JSON: {e}"
             logger.error(error_msg)
             raise
+
+class TrajectoryDataset(Dataset, ABC):
+    def __init__(self, name: str, split: str, config: Optional[Dict] = None):
+        self.name = name
+        self.split = split
+
+        if config is None:
+            from config import load_datasets_config
+            datasets_config = load_datasets_config()
+            dataset_config = datasets_config.get(name, {})
+        elif hasattr(config, 'dataset'):
+            dataset_config = config.dataset
+        else:
+            dataset_config = config
+
+        self.output_format = dataset_config.get("output_format", "messages")
+        self.max_steps = dataset_config.get("max_steps", 50)
+
+        self.data = self._load_json(self._get_json_path(split))
+        logger.info(f"Loaded {len(self.data)} trajectories from {self._get_json_path(split)}")
+    
+    def _get_json_path(self, split: str) -> Path:
+        return DEFAULT_DATA_DIR / f"{self.name}_{split}.json"
+    
+    def _load_json(self, path: Path) -> List[Dict[str, Any]]:
+        if not path.exists():
+            raise FileNotFoundError(f"JSON file not found: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError(f"Expected list in JSON, got {type(data)}")
+        return data
+    
+    def __len__(self) -> int:
+        return len(self.data)
+    
+    @abstractmethod
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        pass
+    
+    def is_correct(self, prediction: str, ground_truth: str) -> bool:
+        return prediction.strip() == ground_truth.strip()

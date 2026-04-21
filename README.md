@@ -8,6 +8,8 @@ Benchmark and enhance reasoning capabilities in large language models (LLMs)
 
 LLMReasonBench is an evaluation and training framework that measures and improves how well LLMs separate **memory recall** from **logical reasoning**. Based on the methodology from *[Disentangling Memory and Reasoning Ability in Large Language Models](https://github.com/MingyuJ666/Disentangling-Memory-and-Reasoning)*, this tool uses customizable special tokens to explicitly isolate these cognitive processes during inference.
 
+In addition to standard static reasoning tasks, LLMReasonBench supports **interactive benchmarks** such as ALFWorld, where an agent must perform multi‑turn actions in a simulated environment.
+
 ## 🚀 Quick Start
 
 ### Installation
@@ -20,7 +22,7 @@ cd LLMReasonBench
 ./install.sh
 ```
 
-### Generate Chain‑of‑Thought (CoT) Data
+### Generate Chain‑of‑Thought (CoT) Data (Static Datasets)
 
 Before training, you must generate structured CoT steps for your dataset. The generator uses an LLM (vLLM for local inference or OpenAI API) to create steps annotated with the special tokens defined in `COT_TOKENS` (by default, `<memory>` for factual extraction and `<reason>` for logical operations).
 
@@ -31,17 +33,33 @@ Before training, you must generate structured CoT steps for your dataset. The ge
 
 > **Note:** Generation requires a valid LLM backend. The default is `vllm` with teacher model `Qwen/Qwen3.5-27B`. Configure paths or API keys in `conf/settings.yaml`.
 
-### Train a Model
+### Generate Expert Trajectories (Interactive Datasets)
 
-After generating CoT data, you can fine‑tune a base model (configured via `common.model` in `conf/settings.yaml`):
+For interactive benchmarks like **ALFWorld**, the generation process uses the teacher model (or an optional scripted fallback) to interact with the environment and record full action‑observation trajectories. The generator employs enhanced prompting strategies, including goal‑locking, systematic surface search, and task‑specific guidance, to ensure high‑quality trajectory generation.
 
 ```bash
-# Standard supervised fine‑tuning (using LoRA by default)
+# Generate expert trajectories for ALFWorld (TextWorld)
+./run.sh --generate --dataset alfworld
+```
+
+Interactive generation parameters are defined in `conf/datasets.yaml` (e.g., `task_source`, `max_steps`, `output_format`, `filter_success`, `use_butler_fallback`). The generator automatically parses the goal to extract target objects and receptacles, adapting to various ALFWorld task templates.
+
+### Train a Model
+
+After generating CoT data (or expert trajectories), you can fine‑tune a base model (configured via `common.model` in `conf/settings.yaml`):
+
+```bash
+# Standard supervised fine‑tuning for single‑turn datasets
 ./run.sh --train --dataset truthfulqa
+
+# Multi‑turn conversational fine‑tuning (e.g., ALFWorld)
+./run.sh --train --dataset alfworld --mode multiturn
 
 # Reinforcement learning (DPO example)
 ./run.sh --train --rl dpo --dataset truthfulqa
 ```
+
+**Multi‑turn training** uses the `--mode multiturn` flag to format conversation histories with the tokenizer's chat template and mask loss only on assistant turns. This mode works with datasets generated with `output_format: "messages"` (like ALFWorld).
 
 Supported RL methods: `dpo`, `cpo`, `kto`, `orpo`.  
 RL configuration files (e.g., `conf/dpo.yaml`) control hyperparameters.
@@ -51,10 +69,19 @@ RL configuration files (e.g., `conf/dpo.yaml`) control hyperparameters.
 Evaluate any fine‑tuned model, adapter, or base model:
 
 ```bash
+# Single‑turn dataset evaluation
 ./run.sh --eval --model /path/to/checkpoint --dataset truthfulqa
+
+# Multi‑turn dataset – offline evaluation (compare final action)
+./run.sh --eval --model /path/to/checkpoint --dataset alfworld
+
+# Multi‑turn dataset – interactive evaluation (run in environment)
+./run.sh --eval --model /path/to/checkpoint --dataset alfworld --interactive
 ```
 
-The evaluation script automatically detects model type (full fine‑tune, PEFT adapter, or base) and loads the appropriate tokenizer.
+For multi‑turn datasets, the evaluator automatically detects the format.
+- Without `--interactive`, it performs **offline evaluation** by comparing the generated final action with the recorded expert action.
+- With `--interactive`, it launches the actual ALFWorld environment and measures **task success rate**.
 
 ## 📊 Model Evaluation
 
@@ -78,17 +105,18 @@ The evaluation script supports:
 
 The following datasets are pre‑configured and ready for immediate use:
 
-| Dataset | Config Key | Answer Type | Hugging Face Source |
-|---------|------------|-------------|----------------------|
-| **GSM8K** | `gsm8k` | Numeric | `openai/gsm8k` |
-| **AIME24** | `aime24` | Numeric | `HuggingFaceH4/aime_2024` |
-| **AIME25** | `aime25` | Numeric | `math-ai/aime25` |
-| **AQUA-RAT** | `aqua` | Multiple Choice | `deepmind/aqua_rat` |
-| **MMLU-Pro** | `mmlupro` | Multiple Choice | `TIGER-Lab/MMLU-Pro` |
-| **TruthfulQA** | `truthfulqa` | Multiple Choice | `truthfulqa/truthful_qa` |
-| **StrategyQA** | `strategyqa` | Boolean | `ChilleD/StrategyQA` |
-| **MetaMathQA** | `metamathqa` | Numeric | `meta-math/MetaMathQA` |
-| **CommonsenseQA** | `commonsenseqa` | Multiple Choice | `tau/commonsense_qa` |
+| Dataset | Config Key | Answer Type | Type | Hugging Face / Source |
+|---------|------------|-------------|------|------------------------|
+| **GSM8K** | `gsm8k` | Numeric | Static | `openai/gsm8k` |
+| **AIME24** | `aime24` | Numeric | Static | `HuggingFaceH4/aime_2024` |
+| **AIME25** | `aime25` | Numeric | Static | `math-ai/aime25` |
+| **AQUA-RAT** | `aqua` | Multiple Choice | Static | `deepmind/aqua_rat` |
+| **MMLU-Pro** | `mmlupro` | Multiple Choice | Static | `TIGER-Lab/MMLU-Pro` |
+| **TruthfulQA** | `truthfulqa` | Multiple Choice | Static | `truthfulqa/truthful_qa` |
+| **StrategyQA** | `strategyqa` | Boolean | Static | `ChilleD/StrategyQA` |
+| **MetaMathQA** | `metamathqa` | Numeric | Static | `meta-math/MetaMathQA` |
+| **CommonsenseQA** | `commonsenseqa` | Multiple Choice | Static | `tau/commonsense_qa` |
+| **ALFWorld** | `alfworld` | Action Sequence | Interactive | ALFWorld TextWorld |
 
 ### Direct Dataset Download
 
@@ -108,50 +136,106 @@ By default, this downloads the **train** split and saves it as `data/<output_nam
 
 ### Adding Custom Datasets
 
-To add a new dataset, follow these three steps:
+#### Static Datasets (Single‑Turn)
 
-#### 1. Update `conf/datasets.yaml`
+To add a new static dataset, follow these three steps:
 
-```yaml
-my_dataset:
-  source: "my-org/my-dataset"
-  split_mapping:
-    train: "train"
-    test: "test"
-  answer_type: "multiple_choice"   # one of: multiple_choice, numeric, boolean
-  field_mapping:
-    question: "question_field"
-    answer: "answer_field"
-    options: "choices_field"       # optional, for multiple choice
-  clean_latex: false               # optional, strip LaTeX formatting
-```
+1. **Update `conf/datasets.yaml`**
 
-#### 2. Create a Dataset Class
+   ```yaml
+   my_dataset:
+     source: "my-org/my-dataset"
+     split_mapping:
+       train: "train"
+       test: "test"
+     answer_type: "multiple_choice"   # one of: multiple_choice, numeric, boolean, action_sequence
+     field_mapping:
+       question: "question_field"
+       answer: "answer_field"
+       options: "choices_field"       # optional, for multiple choice
+     clean_latex: false               # optional, strip LaTeX formatting
+   ```
 
-Create `src/dataset/my_dataset.py`:
+2. **Create a Dataset Class** (`src/dataset/my_dataset.py`):
 
-```python
-from preprocess import JsonDataset
-from generator import DatasetGenerator
+   ```python
+   from preprocess import JsonDataset
+   from generator import DatasetGenerator
 
-class MyDatasetGenerator(DatasetGenerator):
-    """Optional custom generator logic."""
-    pass
+   class MyDatasetGenerator(DatasetGenerator):
+       """Optional custom generator logic."""
+       pass
 
-class MyDataset(JsonDataset):
-    INSTRUCTION = "Solve the following problem step by step."
-```
+   class MyDataset(JsonDataset):
+       INSTRUCTION = "Solve the following problem step by step."
+   ```
 
-#### 3. Register in `src/dataset/__init__.py`
+3. **Register in `src/dataset/__init__.py`**:
 
-```python
-from .my_dataset import MyDatasetGenerator, MyDataset
+   ```python
+   from .my_dataset import MyDatasetGenerator, MyDataset
 
-GENERATOR_MAP['my_dataset'] = MyDatasetGenerator
-DATASET_MAP['my_dataset'] = MyDataset
-```
+   GENERATOR_MAP['my_dataset'] = MyDatasetGenerator
+   DATASET_MAP['my_dataset'] = MyDataset
+   ```
 
-Now you can use `--dataset my_dataset` with all LLMReasonBench commands.
+#### Interactive Datasets (Multi‑Turn)
+
+For interactive benchmarks (e.g., ALFWorld), use the `InteractiveGenerator` base class and create a corresponding `JsonDataset` subclass.
+
+1. **Configure `conf/datasets.yaml`** with `interactive: true`:
+
+   ```yaml
+   my_interactive:
+     name: "My Interactive Dataset"
+     answer_type: "action_sequence"
+     task_source: "pick_and_place_simple"  # Built‑in task type or path to JSON file
+     max_steps: 50
+     interactive: true
+     output_format: "messages"             # "messages" (chat-style) or "trajectory" (step-by-step)
+     filter_success: true                  # Keep only successful episodes
+     use_butler_fallback: true             # Optional fallback policy
+   ```
+
+2. **Create Generator and Dataset Classes** (`src/dataset/my_interactive_dataset.py`):
+
+   ```python
+   from typing import Any, Dict, List
+   from preprocess import TrajectoryDataset
+   from generator import InteractiveGenerator
+
+   class MyInteractiveGenerator(InteractiveGenerator):
+       def setup_environment(self, task: Dict[str, Any]) -> Any:
+           # Initialize environment (e.g., gym, TextWorld)
+           pass
+
+       # Optionally override load_builtin_tasks() for non‑file task sources
+       def load_builtin_tasks(self) -> List[Dict[str, Any]]:
+           # Return list of task dicts
+           pass
+
+   class MyInteractiveDataset(TrajectoryDataset):
+       INSTRUCTION = "Your task instruction here."
+
+       def __init__(self, name: str, split: str, config):
+           super().__init__(name, split, config)
+
+       # __getitem__ can be overridden to return custom episode data.
+       # The base class loads the JSON file and provides the raw data via self.data.
+       # Multi‑turn training uses the conversation format directly; see train.py for details.
+       # See Alfworld for a complete reference implementation.
+   ```
+
+3. **Register in `src/dataset/__init__.py`**:
+
+   ```python
+   from .my_interactive_dataset import MyInteractiveGenerator, MyInteractiveDataset
+
+   GENERATOR_MAP['my_interactive'] = MyInteractiveGenerator
+   DATASET_MAP['my_interactive'] = MyInteractiveDataset
+   ```
+
+Interactive generation automatically leverages the LLM client defined in `conf/settings.yaml` (`generator` section).
 
 ## ⚙️ Configuration
 
@@ -189,11 +273,15 @@ generator:
     model: "Qwen/Qwen3.5-27B"         # Teacher model for CoT generation
     tensor_parallel_size: 1
     gpu_memory_utilization: 0.8
+  api:                                # Used when backend='api'
+    api_key: ""
+    api_base: "https://api.openai.com/v1"
+    model: "gpt-4o"
 ```
 
 ### Dataset Configuration
 
-`conf/datasets.yaml` defines each dataset’s properties. The main fields are:
+`conf/datasets.yaml` defines each dataset’s properties. For static datasets, the main fields are:
 
 | Field | Description |
 |-------|-------------|
@@ -204,6 +292,16 @@ generator:
 | `valid_answers` | (Multiple choice) Allowed letters, e.g., `["A","B","C"]` |
 | `field_mapping` | Maps dataset fields to `question`, `answer`, `options` |
 | `clean_latex` | Remove LaTeX formatting (e.g., `\frac{1}{2}` → `1/2`) |
+
+For interactive datasets, you must set `interactive: true` and provide environment‑specific parameters. Common fields include:
+
+| Field | Description |
+|-------|-------------|
+| `task_source` | Built‑in task type (e.g., `pick_and_place_simple`) or path to JSON file |
+| `max_steps` | Maximum steps per episode (default: 50) |
+| `output_format` | `"messages"` (chat-style) or `"trajectory"` (step-by-step) |
+| `filter_success` | Keep only successful episodes (default: `true`) |
+| `use_butler_fallback` | Enable scripted fallback policy (default: `true`) |
 
 ### Special Token Configuration
 
@@ -226,21 +324,23 @@ END_MARK = True # True: <token> content </token> | False: <token>: content
 - The **`prerequisite`** flag indicates that steps of that token type are generated **before** the main reasoning and then used as context (like memory) for the remaining steps.
 - All token types without `prerequisite: True` are generated in the second stage, after the prerequisite steps are available.
 
+For interactive datasets like ALFWorld, the injection of these CoT tokens into the prompts is controlled by the `parameter_efficient_mode` setting. When the mode is set to `lora-cog-frozen` or `lora-cog-tuned`, the generator will explicitly instruct the model to structure its reasoning using the `<memory>` and `<reason>` tags.
+
 ### Chain‑of‑Thought (CoT) Format
 
 LLMReasonBench supports two output formats controlled by the `END_MARK` flag in `conf/tokens.py`:
 
 - **Colon format** (`END_MARK = False`):
-  ```
-  <memory>: The problem states that x = 5.
-  <reason>: Using x = 5, calculate 2*x = 10.
-  ```
+   ```
+   <memory>: The problem states that x = 5.
+   <reason>: Using x = 5, calculate 2*x = 10.
+   ```
 
 - **Closing‑tag format** (`END_MARK = True`):
-  ```
-  <memory> The problem states that x = 5. </memory>
-  <reason> Using x = 5, calculate 2*x = 10. </reason>
-  ```
+   ```
+   <memory> The problem states that x = 5. </memory>
+   <reason> Using x = 5, calculate 2*x = 10. </reason>
+   ```
 
 ## 📄 License
 

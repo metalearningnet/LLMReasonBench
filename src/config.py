@@ -7,6 +7,15 @@ import dataclasses
 from pathlib import Path
 from typing import Dict, Any, Optional, TypeVar, Union, List
 
+LOG_PRED = True # Enable logging of model predictions during inference
+ENABLE_THINKING = False
+
+SHOW_EVAL = True
+SHOW_ACTION = False
+SHOW_PROMPT = False
+SHOW_RESPONSE = False
+SHOW_TRAJECTORY_ON_FAIL = True
+
 LOG_LEVELS = {
     'INFO': logging.INFO,
     'DEBUG': logging.DEBUG,
@@ -14,8 +23,6 @@ LOG_LEVELS = {
     'WARNING': logging.WARNING,
     'CRITICAL': logging.CRITICAL
 }
-
-LOG_PRED = True # Enable logging of model predictions during inference
 
 CHOICE_MAP = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -29,7 +36,8 @@ PROJECT_ROOT = Path(__file__).parent.parent
 CONF_DIR = PROJECT_ROOT / "conf"
 
 sys.path.append(str(CONF_DIR))
-from tokens import *
+from tokens import COT_TOKENS, END_MARK
+COT_TOKEN_NAMES = list(COT_TOKENS.keys())
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 DEFAULT_CHECKPOINT_DIR = DEFAULT_OUTPUT_DIR / "checkpoint"

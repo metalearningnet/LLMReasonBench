@@ -1,3 +1,4 @@
+import sys
 import yaml
 import torch
 import shutil
@@ -11,17 +12,16 @@ from model_loader import CausalLM
 from typing import Optional, Dict, List
 from dataclasses import dataclass, field
 from peft_model import PeftModelForCausalLMWrapper
+from multiturn_dataset import make_multiturn_data_module
 from supervised_dataset import make_supervised_data_module
 from fixed_length_dataset import make_fixed_length_data_module
 from transformers.utils import logging as transformers_logging
 from peft import LoraConfig, TaskType, prepare_model_for_kbit_training
 from config import (
-    COT_TOKENS, END_MARK, DEFAULT_TRAIN_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR,
+    COT_TOKEN_NAMES, END_MARK, DEFAULT_TRAIN_OUTPUT_DIR, DEFAULT_CHECKPOINT_DIR,
     load_config, load_datasets_config, update_dataclass_from_config,
     setup_directories, logger, dataset_names
 )
-
-COT_TOKEN_NAMES = list(COT_TOKENS.keys())
 
 if END_MARK:
     COT_TOKEN_LIST = [f"<{i}>" for i in COT_TOKEN_NAMES] + [f"</{i}>" for i in COT_TOKEN_NAMES]
@@ -75,7 +75,7 @@ class DataArguments:
     )
     mode: str = field(
         default="supervised",
-        metadata={"choices": ["supervised", "fixed_length"]}
+        metadata={"choices": ["supervised", "fixed_length", "multiturn"]}
     )
     num_train: Optional[int] = field(default=None)
     num_test: Optional[int] = field(default=None)
@@ -429,10 +429,17 @@ def train_rl_mode(rl_mode: str, data_args: DataArguments, model_args: ModelArgum
             logger.info("WandB run finished")
 
 def train():
+    user_provided_mode = False
+    for arg in sys.argv[1:]:
+        if arg == '--mode' or arg.startswith('--mode='):
+            user_provided_mode = True
+            break
+    
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args, remaining_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     config = load_config()
     rl_mode = None
+
     if "--rl" in remaining_args:
         rl_index = remaining_args.index("--rl")
         if rl_index + 1 < len(remaining_args) and not remaining_args[rl_index + 1].startswith("--"):
@@ -444,7 +451,7 @@ def train():
     if checkpoint_dir.exists():
         shutil.rmtree(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    
+
     if rl_mode:
         return train_rl_mode(
             rl_mode=rl_mode,
@@ -452,11 +459,10 @@ def train():
             model_args=model_args,
             training_args=training_args
         )
-    
-    
+
     if not data_args.dataset:
         data_args.dataset = config['common']['dataset']
-    
+
     model_args = update_dataclass_from_config(model_args, config, ['common', 'train'])
     data_args = update_dataclass_from_config(data_args, config, ['common', 'train'])
     training_args = update_dataclass_from_config(training_args, config, ['common', 'train'])
@@ -464,7 +470,7 @@ def train():
     if 'batch_size' in config['common']:
         training_args.per_device_train_batch_size = config['common']['batch_size']
         training_args.per_device_eval_batch_size = config['common']['batch_size']
-    
+
     logger.info("Starting training process")
     logger.info(f"Model arguments: {model_args}")
     logger.info(f"Data arguments: {data_args}")
@@ -483,18 +489,19 @@ def train():
         logger.info(f"  - target_modules: {model_args.lora_target_modules}")
         logger.info(f"  - init_lora_weights: {model_args.lora_init_lora_weights}")
         logger.info(f"  - fan_in_fan_out: {model_args.lora_fan_in_fan_out}")
-    
+
     if model_args.hf_hub_token:
         try:
             login(token=model_args.hf_hub_token)
             logger.info("Successfully logged in to Hugging Face Hub")
         except Exception as e:
             logger.warning(f"Failed to login to Hugging Face Hub: {e}")
-    
+
     model_max_length = training_args.max_prompt_length + training_args.max_completion_length
     tokenizer = create_tokenizer(model_args.model, training_args.cache_dir)
     tokenizer.model_max_length = model_max_length
     logger.info(f"Tokenizer configured with max length: {model_max_length}")
+
     cot_tokens = create_cot_tokens(config, tokenizer)
     if cot_tokens:
         logger.info(f"Added {len(cot_tokens)} CoT tokens")
@@ -510,46 +517,57 @@ def train():
         del temp_tokenizer
     n_tokens_needed = max(len(cot_tokens), len(tokenizer) - orig_vocab_size)
     logger.info(f"Model base vocab size: {orig_vocab_size}, tokenizer final size: {len(tokenizer)} -> need {n_tokens_needed} new tokens")
-    
+
     try:
         data_class = get_data_class(data_args.dataset)
         logger.debug(f"Using dataset class: {data_class.__name__}")
     except NotImplementedError as e:
         logger.error(f"Dataset error: {e}")
         return
-    
+
     data_config = DataConfig()
     datasets_config = load_datasets_config()
     data_config.dataset = datasets_config[data_args.dataset]
-    
+
+    if not user_provided_mode:
+        dataset_cfg = datasets_config.get(data_args.dataset, {})
+        if dataset_cfg.get('interactive', False) and dataset_cfg.get('output_format') == 'messages':
+            logger.info(f"Auto‑inferring mode='multiturn' from dataset configuration (interactive with messages)")
+            data_args.mode = "multiturn"
+        elif dataset_cfg.get('fixed_length', False):
+            logger.info(f"Auto‑inferring mode='fixed_length' from dataset configuration")
+            data_args.mode = "fixed_length"
+
     try:
         train_dataset = data_class(data_args.dataset, "train", config=data_config)
         logger.info(f"Successfully loaded training dataset {data_args.dataset} with {len(train_dataset)} examples")
         if data_args.num_train is not None:
             limit = min(data_args.num_train, len(train_dataset))
-            train_dataset.x = train_dataset.x[:limit]
-            train_dataset.y = train_dataset.y[:limit]
+            if hasattr(train_dataset, 'x') and hasattr(train_dataset, 'y'):
+                train_dataset.x = train_dataset.x[:limit]
+                train_dataset.y = train_dataset.y[:limit]
             if hasattr(train_dataset, 'data'):
                 train_dataset.data = train_dataset.data[:limit]
             logger.info(f"Limited training dataset to {limit} examples (num_train={data_args.num_train})")
     except Exception as e:
         logger.error(f"Failed to load training dataset: {e}", exc_info=True)
         return
-    
+
     try:
         eval_dataset = data_class(data_args.dataset, "test", config=data_config)
         logger.info(f"Evaluation dataset loaded successfully: {len(eval_dataset)} examples")
         if data_args.num_test is not None:
             limit = min(data_args.num_test, len(eval_dataset))
-            eval_dataset.x = eval_dataset.x[:limit]
-            eval_dataset.y = eval_dataset.y[:limit]
+            if hasattr(eval_dataset, 'x') and hasattr(eval_dataset, 'y'):
+                eval_dataset.x = eval_dataset.x[:limit]
+                eval_dataset.y = eval_dataset.y[:limit]
             if hasattr(eval_dataset, 'data'):
                 eval_dataset.data = eval_dataset.data[:limit]
             logger.info(f"Limited evaluation dataset to {limit} examples (num_test={data_args.num_test})")
     except Exception as e:
         logger.warning(f"No evaluation dataset: {e}")
         eval_dataset = None
-    
+
     try:
         if data_args.mode == "supervised":
             data_module = make_supervised_data_module(
@@ -568,20 +586,29 @@ def train():
                 seed=config['common']['seed']
             )
             logger.info("Created fixed length data module")
+        elif data_args.mode == "multiturn":
+            data_module = make_multiturn_data_module(
+                tokenizer=tokenizer,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                max_length=model_max_length,
+                seed=config['common']['seed']
+            )
+            logger.info("Created multi‑turn data module")
         else:
             logger.error(f"Unknown mode: {data_args.mode}")
             return
     except Exception as e:
         logger.error(f"Failed to create data module: {e}", exc_info=True)
         return
-    
+
     try:
         model = load_model(model_args, training_args, n_tokens_needed, tokenizer)
         logger.info(f"Model loaded successfully: {model_args.model}")
     except Exception as e:
         logger.error(f"Failed to load model: {e}", exc_info=True)
         return
-    
+
     try:
         peft_mode = model_args.parameter_efficient_mode
         if 'lora' in model_args.parameter_efficient_mode:
@@ -593,7 +620,7 @@ def train():
             for param in model.parameters():
                 param.requires_grad = False
             logger.info("LoRA is not enabled; froze all base model parameters")
-        
+
         if 'cog-tuned' in peft_mode:
             enable_cog_tuning(model)
             logger.info("Applied cognitive token tuning")
@@ -605,9 +632,9 @@ def train():
     except Exception as e:
         logger.error(f"Failed to apply PEFT: {e}", exc_info=True)
         return
-    
+
     log_trainable_parameters(model)
-    
+
     wandb_run = None
     if config.get('logging', {}).get('wandb_project'):
         try:
@@ -631,7 +658,7 @@ def train():
             logger.warning("WandB not installed, skipping initialization")
         except Exception as e:
             logger.warning(f"Failed to initialize WandB: {e}")
-    
+
     try:
         trainer = LMTrainer(
             model=model,
@@ -643,7 +670,7 @@ def train():
     except Exception as e:
         logger.error(f"Failed to create trainer: {e}", exc_info=True)
         return
-    
+
     try:
         logger.info("Starting new training session")
         trainer.train()
@@ -653,14 +680,14 @@ def train():
         if wandb_run:
             wandb_run.finish()
         return
-    
+
     try:
         trainer.save_state()
         trainer.save_model(output_dir=str(training_args.checkpoint_dir))
         logger.info(f"Model saved successfully to: {training_args.checkpoint_dir}")
     except Exception as e:
         logger.error(f"Failed to save model: {e}", exc_info=True)
-    
+
     try:
         config_output_path = Path(training_args.checkpoint_dir) / 'training_config.yaml'
         with open(config_output_path, 'w') as f:
@@ -668,11 +695,11 @@ def train():
         logger.info(f"Training config saved to: {config_output_path}")
     except Exception as e:
         logger.error(f"Failed to save training config: {e}")
-    
+
     if wandb_run:
         wandb_run.finish()
         logger.info("WandB run finished")
-    
+
     logger.info(f"Model: {model_args.model}")
     logger.info(f"Model saved at: {str(training_args.checkpoint_dir)}")
     logger.info(f"Output directory: {str(training_args.output_dir)}")

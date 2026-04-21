@@ -114,7 +114,8 @@ Supported Datasets:
   strategyqa       StrategyQA
   metamathqa       MetaMathQA
   commonsenseqa    CommonsenseQA
-  
+  alfworld         ALFWorld (multi‑turn interactive)
+
 Generator Options:
   --dataset DATASET       Dataset to generate (see Supported Datasets)
   --mode MODE             Generation mode: train | test
@@ -128,18 +129,27 @@ Training Options:
   --dataset DATASET       Dataset for training
   --model MODEL           Base model or checkpoint path
   --num-train NUM         Number of training examples
+  --mode MODE             Training mode: supervised | fixed_length | multiturn
   --rl MODE               RL training mode: dpo | cpo | kto | orpo (requires --train)
 
 Evaluation Options:
   --dataset DATASET       Dataset for evaluation
   --model MODEL           Trained model checkpoint
   --num-test NUM          Number of test examples
+  --interactive           (Multi‑turn only) Use interactive environment evaluation
 
 Examples:
+  # Single‑turn CoT generation and training
   $0 --generate --dataset truthfulqa --mode train
   $0 --train --dataset truthfulqa --model Qwen/Qwen3.5-9B
   $0 --train --rl dpo --dataset truthfulqa --model Qwen/Qwen3.5-9B
   $0 --eval --dataset truthfulqa --model $CHECKPOINT_DIR
+
+  # Multi‑turn interactive dataset (ALFWorld)
+  $0 --generate --dataset alfworld
+  $0 --train --dataset alfworld --model Qwen/Qwen3.5-9B --mode multiturn
+  $0 --eval --dataset alfworld --model $CHECKPOINT_DIR
+  $0 --eval --dataset alfworld --model $CHECKPOINT_DIR --interactive
 
 EOF
 }

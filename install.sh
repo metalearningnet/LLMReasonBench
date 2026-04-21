@@ -124,6 +124,7 @@ setup_venv() {
             log_error "Failed to create virtual environment. Ensure Python $UV_PYTHON_VERSION is available (try: uv python install $UV_PYTHON_VERSION)"
     fi
 
+    export PATH="$(pwd)/.venv/bin:$PATH"
     source .venv/bin/activate || log_error "Failed to activate virtual environment"
     log_info "Virtual environment ready: .venv (Python: $(python --version 2>&1))"
 }
@@ -345,6 +346,7 @@ install_packages() {
         threadpoolctl tokenizers toml tornado tqdm traitlets
         triton typing_extensions tzdata urllib3 wandb
         watchdog wcwidth Werkzeug xxhash yarl zipp trl
+        alfworld h5py
     )
 
     log_info "Installing Python packages..."
@@ -358,6 +360,22 @@ install_packages() {
     export UV_TORCH_BACKEND=auto
     uv pip install "vllm==${UV_VLLM_VERSION}" || log_warning "vLLM installation failed"
     uv pip install -U transformers || log_warning "Failed to upgrade Transformers"
+
+    log_info "Verifying ALFWorld installation..."
+    if ! uv run python -c "import alfworld" 2>/dev/null; then
+        log_error "ALFWorld package not properly installed. Please check the installation logs."
+    fi
+
+    if ! command -v alfworld-download &>/dev/null; then
+        log_error "alfworld-download command not found. ALFWorld installation appears incomplete."
+    fi
+
+    log_info "Downloading ALFWorld data..."
+    if alfworld-download; then
+        log_info "ALFWorld data downloaded successfully"
+    else
+        log_error "ALFWorld data download failed. Cannot proceed without required game files."
+    fi
 }
 
 install_model() {
