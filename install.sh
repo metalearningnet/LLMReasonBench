@@ -4,7 +4,7 @@ set -euo pipefail
 PYTHON=${PYTHON:-python3}
 TORCH_VERSION=${TORCH_VERSION:-2.10.0}
 TORCH_CUDA_VERSION=${TORCH_CUDA_VERSION:-cu130}
-UV_VLLM_VERSION=${UV_VLLM_VERSION:-0.19.0}
+UV_VLLM_VERSION=${UV_VLLM_VERSION:-0.19.1}
 UV_PYTHON_VERSION=${UV_PYTHON_VERSION:-3.12}
 UV_INSTALL_METHOD=${UV_INSTALL_METHOD:-standalone}
 
@@ -164,9 +164,8 @@ ${BOLD}MODEL INSTALLATION OPTIONS${RESET}
 
 ${BOLD}DATASET INSTALLATION OPTIONS${RESET}
     --dataset DATASET            Hugging Face dataset identifier (required)
-                                 Example: 'metalearningnet/qwen3-metamathqa-cot'
+                                 Example: 'metalearningnet/qwen3.5-metamathqa-cot'
     --name NAME                  Output filename without extension (required)
-                                 Example: 'metamathqa' → 'metamathqa_train.json'
     --split SPLIT                Dataset split to download
     --config CONFIG              Configuration name for multi‑config datasets
     --max-length LENGTH          Limit number of examples
@@ -346,7 +345,7 @@ install_packages() {
         threadpoolctl tokenizers toml tornado tqdm traitlets
         triton typing_extensions tzdata urllib3 wandb
         watchdog wcwidth Werkzeug xxhash yarl zipp trl
-        alfworld h5py
+        alfworld h5py arc-agi
     )
 
     log_info "Installing Python packages..."

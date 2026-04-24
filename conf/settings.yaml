@@ -1,6 +1,6 @@
 common:
   model: "Qwen/Qwen3.5-4B"                          # Base causal language model
-  parameter_efficient_mode: "lora-cog-tuned"        # PEFT strategy
+  parameter_efficient_mode: "lora"                  # PEFT strategy: 'lora' | 'lora-cog-frozen' | 'lora-cog-tuned'
 
   dataset: "truthfulqa"                             # Default dataset
   hf_hub_token: ""                                  # Hugging Face token
@@ -31,7 +31,7 @@ train:
   learning_rate: 0.00001                            # Peak learning rate for the optimizer
   num_train_epochs: 1                               # Number of training epochs
   max_prompt_length: 512                            # Maximum token length for the input prompt
-  max_completion_length: 2048                       # Maximum token length for the model's completion
+  max_completion_length: 65536                      # Maximum token length for the model's completion
   warmup_steps: 100                                 # Warmup steps for scheduler
   gradient_accumulation_steps: 8                    # Gradient accumulation steps
   logging_steps: 1000                               # Log every N steps
@@ -81,4 +81,4 @@ logging:
 experiment:
   name: "mem"                                       # Unique run identifier for W&B dashboard and artifact tracking
   notes: "Memory and Reasoning"                     # Description to help identify the purpose of this experiment later
-  tags: ["lora", "cog", "tuned"]                    # Filterable metadata tags for organizing and comparing runs
+  tags: ["lora"]                                    # Filterable metadata tags for organizing and comparing runs

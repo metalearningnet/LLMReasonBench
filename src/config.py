@@ -11,9 +11,9 @@ LOG_PRED = True # Enable logging of model predictions during inference
 ENABLE_THINKING = False
 
 SHOW_EVAL = True
-SHOW_ACTION = False
-SHOW_PROMPT = False
-SHOW_RESPONSE = False
+SHOW_ACTION = True
+SHOW_PROMPT = True
+SHOW_RESPONSE = True
 SHOW_TRAJECTORY_ON_FAIL = True
 
 LOG_LEVELS = {

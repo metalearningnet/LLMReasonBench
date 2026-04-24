@@ -1,3 +1,4 @@
+from .arc3 import ARC3Generator, ARC3
 from .aqua import AquaGenerator, Aqua
 from .gsm8k import GSM8KGenerator, GSM8K
 from .aime24 import AIME24Generator, AIME24
@@ -10,6 +11,7 @@ from .metamathqa import MetaMathQAGenerator, MetaMathQA
 from .commonsenseqa import CommonsenseQAGenerator, CommonsenseQA
 
 GENERATOR_MAP = {
+    'arc3': ARC3Generator,
     'aqua': AquaGenerator,
     'gsm8k': GSM8KGenerator,
     'aime24': AIME24Generator,
@@ -23,6 +25,7 @@ GENERATOR_MAP = {
 }
 
 DATASET_MAP = {
+    'arc3': ARC3,
     'aqua': Aqua,
     'gsm8k': GSM8K,
     'aime24': AIME24,

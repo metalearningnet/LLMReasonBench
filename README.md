@@ -8,7 +8,7 @@ Benchmark and enhance reasoning capabilities in large language models (LLMs)
 
 LLMReasonBench is an evaluation and training framework that measures and improves how well LLMs separate **memory recall** from **logical reasoning**. Based on the methodology from *[Disentangling Memory and Reasoning Ability in Large Language Models](https://github.com/MingyuJ666/Disentangling-Memory-and-Reasoning)*, this tool uses customizable special tokens to explicitly isolate these cognitive processes during inference.
 
-In addition to standard static reasoning tasks, LLMReasonBench supports **interactive benchmarks** such as ALFWorld, where an agent must perform multi‑turn actions in a simulated environment.
+In addition to standard static reasoning tasks, LLMReasonBench supports **interactive benchmarks** such as ALFWorld and ARC‑AGI‑3, where an agent must perform multi‑turn actions in a simulated environment.
 
 ## 🚀 Quick Start
 
@@ -26,6 +26,8 @@ cd LLMReasonBench
 
 Before training, you must generate structured CoT steps for your dataset. The generator uses an LLM (vLLM for local inference or OpenAI API) to create steps annotated with the special tokens defined in `COT_TOKENS` (by default, `<memory>` for factual extraction and `<reason>` for logical operations).
 
+> **⚠️ Important:** For generating CoT steps, the `parameter_efficient_mode` in `conf/settings.yaml` **must** be set to either `lora-cog-frozen` or `lora-cog-tuned`. This enables the special token‑guided reasoning structure required by the generator.
+
 ```bash
 # Generate CoT data for TruthfulQA training set (using vLLM backend by default)
 ./run.sh --generate --dataset truthfulqa --mode train
@@ -35,14 +37,17 @@ Before training, you must generate structured CoT steps for your dataset. The ge
 
 ### Generate Expert Trajectories (Interactive Datasets)
 
-For interactive benchmarks like **ALFWorld**, the generation process uses the teacher model (or an optional scripted fallback) to interact with the environment and record full action‑observation trajectories. The generator employs enhanced prompting strategies, including goal‑locking, systematic surface search, and task‑specific guidance, to ensure high‑quality trajectory generation.
+For interactive benchmarks like **ALFWorld** and **ARC‑AGI‑3**, the generation process uses the teacher model (or an optional scripted fallback) to interact with the environment and record full action‑observation trajectories. The generator employs enhanced prompting strategies, including goal‑locking, systematic surface search, and task‑specific guidance, to ensure high‑quality trajectory generation.
 
 ```bash
 # Generate expert trajectories for ALFWorld (TextWorld)
 ./run.sh --generate --dataset alfworld
+
+# Generate expert trajectories for ARC‑AGI‑3
+./run.sh --generate --dataset arc3
 ```
 
-Interactive generation parameters are defined in `conf/datasets.yaml` (e.g., `task_source`, `max_steps`, `output_format`, `filter_success`, `use_butler_fallback`). The generator automatically parses the goal to extract target objects and receptacles, adapting to various ALFWorld task templates.
+Interactive generation parameters are defined in `conf/datasets.yaml` (e.g., `task_source`, `max_steps`, `output_format`, `filter_success`, `game_ids`). The ALFWorld generator automatically parses the goal to extract target objects and receptacles, adapting to various task templates. The ARC‑3 generator interfaces with the `arc-agi` Python package to run puzzle environments in terminal‑rendered mode.
 
 ### Train a Model
 
@@ -52,14 +57,15 @@ After generating CoT data (or expert trajectories), you can fine‑tune a base m
 # Standard supervised fine‑tuning for single‑turn datasets
 ./run.sh --train --dataset truthfulqa
 
-# Multi‑turn conversational fine‑tuning (e.g., ALFWorld)
+# Multi‑turn conversational fine‑tuning (e.g., ALFWorld, ARC‑3)
 ./run.sh --train --dataset alfworld --mode multiturn
+./run.sh --train --dataset arc3 --mode multiturn
 
 # Reinforcement learning (DPO example)
 ./run.sh --train --rl dpo --dataset truthfulqa
 ```
 
-**Multi‑turn training** uses the `--mode multiturn` flag to format conversation histories with the tokenizer's chat template and mask loss only on assistant turns. This mode works with datasets generated with `output_format: "messages"` (like ALFWorld).
+**Multi‑turn training** uses the `--mode multiturn` flag to format conversation histories with the tokenizer's chat template and mask loss only on assistant turns. This mode works with datasets generated with `output_format: "messages"` (like ALFWorld and ARC‑3).
 
 Supported RL methods: `dpo`, `cpo`, `kto`, `orpo`.  
 RL configuration files (e.g., `conf/dpo.yaml`) control hyperparameters.
@@ -74,14 +80,16 @@ Evaluate any fine‑tuned model, adapter, or base model:
 
 # Multi‑turn dataset – offline evaluation (compare final action)
 ./run.sh --eval --model /path/to/checkpoint --dataset alfworld
+./run.sh --eval --model /path/to/checkpoint --dataset arc3
 
 # Multi‑turn dataset – interactive evaluation (run in environment)
 ./run.sh --eval --model /path/to/checkpoint --dataset alfworld --interactive
+./run.sh --eval --model /path/to/checkpoint --dataset arc3 --interactive
 ```
 
 For multi‑turn datasets, the evaluator automatically detects the format.
 - Without `--interactive`, it performs **offline evaluation** by comparing the generated final action with the recorded expert action.
-- With `--interactive`, it launches the actual ALFWorld environment and measures **task success rate**.
+- With `--interactive`, it launches the actual environment (ALFWorld or ARC‑3) and measures **task success rate**.
 
 ## 📊 Model Evaluation
 
@@ -117,6 +125,7 @@ The following datasets are pre‑configured and ready for immediate use:
 | **MetaMathQA** | `metamathqa` | Numeric | Static | `meta-math/MetaMathQA` |
 | **CommonsenseQA** | `commonsenseqa` | Multiple Choice | Static | `tau/commonsense_qa` |
 | **ALFWorld** | `alfworld` | Action Sequence | Interactive | ALFWorld TextWorld |
+| **ARC-AGI-3** | `arc3` | Action Sequence | Interactive | ARC Prize / `arc-agi` package |
 
 ### Direct Dataset Download
 
@@ -128,7 +137,7 @@ You can quickly download and prepare **any** Hugging Face dataset without runnin
 
 **Example:**
 ```bash
-./install.sh --dataset metalearningnet/qwen3-metamathqa-cot --name metamathqa
+./install.sh --dataset metalearningnet/qwen3.5-metamathqa-cot --name metamathqa
 ```
 
 By default, this downloads the **train** split and saves it as `data/<output_name>_train.json`. To download a different split, use `--split`. The dataset will be saved to `data/<output_name>_<split>.json`.  
@@ -181,7 +190,7 @@ To add a new static dataset, follow these three steps:
 
 #### Interactive Datasets (Multi‑Turn)
 
-For interactive benchmarks (e.g., ALFWorld), use the `InteractiveGenerator` base class and create a corresponding `JsonDataset` subclass.
+For interactive benchmarks (e.g., ALFWorld, ARC‑3), use the `InteractiveGenerator` base class and create a corresponding `TrajectoryDataset` subclass.
 
 1. **Configure `conf/datasets.yaml`** with `interactive: true`:
 
@@ -189,12 +198,14 @@ For interactive benchmarks (e.g., ALFWorld), use the `InteractiveGenerator` base
    my_interactive:
      name: "My Interactive Dataset"
      answer_type: "action_sequence"
-     task_source: "pick_and_place_simple"  # Built‑in task type or path to JSON file
-     max_steps: 50
      interactive: true
-     output_format: "messages"             # "messages" (chat-style) or "trajectory" (step-by-step)
-     filter_success: true                  # Keep only successful episodes
-     use_butler_fallback: true             # Optional fallback policy
+     output_format: "messages"              # "messages" (chat-style) or "trajectory"
+     filter_success: true                   # Keep only successful episodes
+     max_steps: 50
+     # Environment‑specific parameters:
+     # game_ids: ["ls20", "ft09"]           # For ARC-3
+     # task_source: "pick_and_place_simple" # For ALFWorld
+     # use_butler_fallback: true            # ALFWorld fallback policy
    ```
 
 2. **Create Generator and Dataset Classes** (`src/dataset/my_interactive_dataset.py`):
@@ -205,25 +216,16 @@ For interactive benchmarks (e.g., ALFWorld), use the `InteractiveGenerator` base
    from generator import InteractiveGenerator
 
    class MyInteractiveGenerator(InteractiveGenerator):
-       def setup_environment(self, task: Dict[str, Any]) -> Any:
-           # Initialize environment (e.g., gym, TextWorld)
+       def setup_environment(self, task: Dict[str, Any], split: str = "train") -> Any:
+           # Initialize environment (e.g., gym, TextWorld, arc-agi)
            pass
 
-       # Optionally override load_builtin_tasks() for non‑file task sources
        def load_builtin_tasks(self) -> List[Dict[str, Any]]:
-           # Return list of task dicts
+           # Return list of task dicts (with 'id', 'goal'/'instruction', etc.)
            pass
 
    class MyInteractiveDataset(TrajectoryDataset):
        INSTRUCTION = "Your task instruction here."
-
-       def __init__(self, name: str, split: str, config):
-           super().__init__(name, split, config)
-
-       # __getitem__ can be overridden to return custom episode data.
-       # The base class loads the JSON file and provides the raw data via self.data.
-       # Multi‑turn training uses the conversation format directly; see train.py for details.
-       # See Alfworld for a complete reference implementation.
    ```
 
 3. **Register in `src/dataset/__init__.py`**:
@@ -235,7 +237,7 @@ For interactive benchmarks (e.g., ALFWorld), use the `InteractiveGenerator` base
    DATASET_MAP['my_interactive'] = MyInteractiveDataset
    ```
 
-Interactive generation automatically leverages the LLM client defined in `conf/settings.yaml` (`generator` section).
+Interactive generation automatically leverages the LLM client defined in `conf/settings.yaml` (`generator` section). Reference implementations are available in `src/dataset/alfworld.py` and `src/dataset/arc3.py`.
 
 ## ⚙️ Configuration
 
@@ -249,12 +251,14 @@ All configuration files reside in the `conf/` directory.
 - Training hyperparameters (`train` section)
 - Generation backend and teacher model (`generator` section)
 
-Example snippet (showing key defaults):
+> **Important for CoT generation:** The `common.parameter_efficient_mode` field **must** be set to `lora-cog-frozen` or `lora-cog-tuned` when generating Chain‑of‑Thought data. These modes enable the structured reasoning with special tokens. For training or evaluation without generation, any valid mode can be used.
+
+Example snippet (showing key defaults and the required mode for CoT generation):
 
 ```yaml
 common:
   model: "Qwen/Qwen3.5-4B"
-  parameter_efficient_mode: "lora-cog-tuned"
+  parameter_efficient_mode: "lora-cog-tuned"   # Required for CoT generation
   lora_config:
     r: 16
     alpha: 16
@@ -297,11 +301,12 @@ For interactive datasets, you must set `interactive: true` and provide environme
 
 | Field | Description |
 |-------|-------------|
-| `task_source` | Built‑in task type (e.g., `pick_and_place_simple`) or path to JSON file |
-| `max_steps` | Maximum steps per episode (default: 50) |
+| `task_source` | (ALFWorld) Built‑in task type or path to JSON file |
+| `game_ids` | (ARC-3) List of game IDs to use (e.g., `["ls20", "ft09"]`) |
+| `max_steps` | Maximum steps per episode |
 | `output_format` | `"messages"` (chat-style) or `"trajectory"` (step-by-step) |
-| `filter_success` | Keep only successful episodes (default: `true`) |
-| `use_butler_fallback` | Enable scripted fallback policy (default: `true`) |
+| `filter_success` | Keep only successful episodes |
+| `use_butler_fallback` | (ALFWorld) Enable scripted fallback policy |
 
 ### Special Token Configuration
 
@@ -324,7 +329,7 @@ END_MARK = True # True: <token> content </token> | False: <token>: content
 - The **`prerequisite`** flag indicates that steps of that token type are generated **before** the main reasoning and then used as context (like memory) for the remaining steps.
 - All token types without `prerequisite: True` are generated in the second stage, after the prerequisite steps are available.
 
-For interactive datasets like ALFWorld, the injection of these CoT tokens into the prompts is controlled by the `parameter_efficient_mode` setting. When the mode is set to `lora-cog-frozen` or `lora-cog-tuned`, the generator will explicitly instruct the model to structure its reasoning using the `<memory>` and `<reason>` tags.
+For interactive datasets like ALFWorld and ARC‑3, the injection of these CoT tokens into the prompts is controlled by the `parameter_efficient_mode` setting. When the mode is set to `lora-cog-frozen` or `lora-cog-tuned`, the generator will explicitly instruct the model to structure its reasoning using the configured tags.
 
 ### Chain‑of‑Thought (CoT) Format
 

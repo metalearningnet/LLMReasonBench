@@ -2128,7 +2128,6 @@ def main(args):
         logger.info(f"Mode: {args.mode}")
         logger.info(f"Examples: {args.num_examples or 'all'}")
     else:
-        logger.info(f"Task Source: {dataset_config.get('task_source', 'unknown')}")
         logger.info(f"Max Steps: {dataset_config.get('max_steps', 50)}")
         logger.info(f"Output Format: {dataset_config.get('output_format', 'messages')}")
     logger.info(f"{'='*60}")

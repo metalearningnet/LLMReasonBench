@@ -287,7 +287,7 @@ run_command() {
     log_info "Running: uv run python $python_script ${args[*]}"
     
     if uv run python "$python_script" "${args[@]}"; then
-        log_success "$operation completed successfully!"
+        log_info "$operation completed!"
         return 0
     else
         log_error "$operation failed with exit code: $?"
@@ -301,9 +301,6 @@ show_summary() {
     local args=("$@")
     
     case "$command" in
-        --generate)
-            log_info "Generated datasets saved to: $DATA_DIR/"
-            ;;
         --train)
             log_info "Model checkpoint saved to: $CHECKPOINT_DIR/"
             local latest_checkpoint
