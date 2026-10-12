@@ -61,7 +61,7 @@ class AlfworldGenerator(InteractiveGenerator):
         self._butler_available = False
         if dataset_config.get("use_butler_fallback", True):
             try:
-                from alfworld.agents.agent import ButlerAgent
+                from alfworld.agents.agent import ButlerAgent  # noqa: F401 (import-availability check)
                 self._butler_agent = None
                 self.fallback_policy = self._butler_fallback
                 self._butler_used = False

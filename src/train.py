@@ -9,7 +9,7 @@ from dataset import DATASET_MAP
 from preprocess import DataConfig
 from huggingface_hub import login
 from model_loader import CausalLM
-from typing import Optional, Dict, List
+from typing import Optional, List
 from dataclasses import dataclass, field
 from peft_model import PeftModelForCausalLMWrapper
 from multiturn_dataset import make_multiturn_data_module
@@ -176,8 +176,10 @@ def create_tokenizer(model_name: str, cache_dir: Optional[str]) -> transformers.
 def create_cot_tokens(
     config: dict,
     tokenizer: transformers.PreTrainedTokenizer
-) -> tuple[Dict[str, str], List[int], List[int]]:
-    if 'tag' not in config['common']['parameter_efficient_mode']:
+) -> List[int]:
+    # CoT delimiters are only added when the PEFT mode explicitly requests
+    # cognitive-token tuning/freezing ('lora-cog-tuned' / 'lora-cog-frozen').
+    if 'cog' not in config['common']['parameter_efficient_mode']:
         return []
     
     logger.info(f"Defining CoT tokens: {COT_TOKEN_LIST}")
@@ -288,7 +290,7 @@ def load_model(
         logger.info("Loading model in 4-bit precision")
     elif training_args.bf16:
         load_kwargs["dtype"] = torch.bfloat16
-        logger.info(f"Loading model with dtype: torch.bfloat16")
+        logger.info("Loading model with dtype: torch.bfloat16")
     elif training_args.fp16:
         load_kwargs["dtype"] = torch.float32
         logger.info("Loading model in fp32 for mixed-precision training")
@@ -413,7 +415,7 @@ def train_rl_mode(rl_mode: str, data_args: DataArguments, model_args: ModelArgum
         logger.info(f"Starting {rl_mode.upper()} training...")
         results = trainer.train()
         
-        logger.info(f"\nRL training completed successfully!")
+        logger.info("\nRL training completed successfully!")
         
         if wandb_run:
             wandb.log(results.get("train_metrics", {}))
@@ -479,7 +481,7 @@ def train():
     setup_directories(config)
 
     if 'lora' in model_args.parameter_efficient_mode:
-        logger.info(f"LoRA Configuration loaded:")
+        logger.info("LoRA Configuration loaded:")
         logger.info(f"  - r: {model_args.lora_r}")
         logger.info(f"  - alpha: {model_args.lora_alpha}")
         logger.info(f"  - dropout: {model_args.lora_dropout}")
@@ -511,7 +513,7 @@ def train():
     if hasattr(orig_config, "vocab_size"):
         orig_vocab_size = orig_config.vocab_size
     else:
-        logger.warning(f"'vocab_size' missing from config. Fetching from base tokenizer.")
+        logger.warning("'vocab_size' missing from config. Fetching from base tokenizer.")
         temp_tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model, trust_remote_code=True)
         orig_vocab_size = len(temp_tokenizer)
         del temp_tokenizer
@@ -532,10 +534,10 @@ def train():
     if not user_provided_mode:
         dataset_cfg = datasets_config.get(data_args.dataset, {})
         if dataset_cfg.get('interactive', False) and dataset_cfg.get('output_format') == 'messages':
-            logger.info(f"Auto‑inferring mode='multiturn' from dataset configuration (interactive with messages)")
+            logger.info("Auto‑inferring mode='multiturn' from dataset configuration (interactive with messages)")
             data_args.mode = "multiturn"
         elif dataset_cfg.get('fixed_length', False):
-            logger.info(f"Auto‑inferring mode='fixed_length' from dataset configuration")
+            logger.info("Auto‑inferring mode='fixed_length' from dataset configuration")
             data_args.mode = "fixed_length"
 
     try:

@@ -59,7 +59,9 @@ generator:
   max_retries: 1                                    # Maximum number of retry attempts
 
   api:                                              # API configuration (used when backend='api')
-    api_key: ""                                     # API key for the LLM service
+    provider: ""                                    # Optional provider: 'openai' | 'deepseek' | 'anthropic' | 'moonshot' | 'zhipu' | 'togetherai' | 'groq' | 'xai'. Auto-loads the matching *_API_KEY env var and default base URL.
+    api_key_env: ""                                 # Optional custom environment variable name to read the API key from (overrides provider-based lookup)
+    api_key: ""                                     # API key for the LLM service (or leave empty to load from environment)
     api_base: "https://api.openai.com/v1"           # API endpoint URL
     timeout: 60                                     # Request timeout in seconds
     retry_min_wait: 1                               # Minimum wait between retries (seconds)

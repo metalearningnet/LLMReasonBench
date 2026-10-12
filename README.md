@@ -1,6 +1,7 @@
 # LLMReasonBench
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/metalearningnet/LLMReasonBench/actions/workflows/ci.yml/badge.svg)](https://github.com/metalearningnet/LLMReasonBench/actions/workflows/ci.yml)
 
 Benchmark and enhance reasoning capabilities in large language models (LLMs)
 
@@ -291,10 +292,28 @@ generator:
     tensor_parallel_size: 1
     gpu_memory_utilization: 0.8
   api:                                # Used when backend='api'
-    api_key: ""
+    provider: ""                      # Optional: 'deepseek' | 'openai' | 'anthropic' | ...
+    api_key_env: ""                   # Optional: custom env var name for the API key
+    api_key: ""                       # Leave empty to load the key from the environment
     api_base: "https://api.openai.com/v1"
     model: "gpt-4o"
 ```
+
+> **API key from environment variables**  
+>  
+> When `backend: "api"`, the generator resolves the API key in this order:
+>  
+> 1. `generator.api.api_key` (or the `--api-key` flag)
+> 2. `generator.api.api_key_env` (a custom environment variable name you specify)
+> 3. The provider's conventional environment variable — set `generator.api.provider` (or `--provider deepseek`) and the matching key is loaded automatically, e.g. `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `MOONSHOT_API_KEY`, `ZHIPUAI_API_KEY`, `TOGETHER_API_KEY`, `GROQ_API_KEY`, `XAI_API_KEY`
+> 4. Generic fallbacks: `OPENAI_API_KEY`, `API_KEY`, `LLM_API_KEY`
+>  
+> Setting a provider also switches the default base URL to that provider's endpoint (unless you explicitly override `api_base`), so a DeepSeek key is never sent to `api.openai.com`. Example:
+>  
+> ```bash
+> export DEEPSEEK_API_KEY="sk-..."
+> ./run.sh --generate --dataset truthfulqa --mode train --provider deepseek
+> ```
 
 ### Dataset Configuration
 
@@ -359,6 +378,28 @@ LLMReasonBench supports two output formats controlled by the `END_MARK` flag in 
    <memory> The problem states that x = 5. </memory>
    <reason> Using x = 5, calculate 2*x = 10. </reason>
    ```
+
+## 🧪 Development & Testing
+
+Install the minimal test dependencies (CPU-only PyTorch, `pytest`, `pytest-cov`, `ruff`) via the single install entry point:
+
+```bash
+./install.sh --dev
+```
+
+Then run the test suite, lint, and coverage report:
+
+```bash
+.venv/bin/python -m pytest -q                              # run unit tests
+.venv/bin/python -m pytest -q --cov=src --cov=conf --cov-report=term-missing   # with coverage
+.venv/bin/ruff check src conf tests                        # lint (pyflakes + syntax)
+```
+
+The CI workflow (`.github/workflows/ci.yml`) runs the same checks — unit tests with a
+coverage floor, `ruff`, shell syntax, and a compile check — on every push and pull
+request. Coverage is gated on the pure-logic modules only; model training, evaluation,
+and interactive-environment code require a GPU/model weights and are out of scope for
+the unit-test suite.
 
 ## 📄 License
 

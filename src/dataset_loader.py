@@ -43,7 +43,7 @@ def download_dataset(
                 logger.info(f"  Available splits: {available_splits}")
                 
                 if 'train' in available_splits:
-                    logger.info(f"  Using 'train' split as fallback")
+                    logger.info("  Using 'train' split as fallback")
                     dataset = all_splits['train']
                 else:
                     first_split = available_splits[0]

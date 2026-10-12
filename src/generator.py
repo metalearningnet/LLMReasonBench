@@ -8,8 +8,8 @@ import openai
 import logging
 from tqdm import tqdm
 from pathlib import Path
+from urllib.parse import urlparse
 from abc import ABC, abstractmethod
-from vllm import LLM, SamplingParams
 from dataclasses import dataclass, field
 from transformers import HfArgumentParser
 from typing import List, Dict, Any, Optional, Tuple, Set, Callable
@@ -21,6 +21,102 @@ from config import (
 
 for logger_name in ["openai", "httpx", "httpcore", "urllib3"]:
     logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+API_PROVIDERS = {
+    'openai': {
+        'api_base': 'https://api.openai.com/v1',
+        'api_key_env': ['OPENAI_API_KEY'],
+    },
+    'deepseek': {
+        'api_base': 'https://api.deepseek.com/v1',
+        'api_key_env': ['DEEPSEEK_API_KEY'],
+    },
+    'anthropic': {
+        'api_base': 'https://api.anthropic.com/v1',
+        'api_key_env': ['ANTHROPIC_API_KEY'],
+    },
+    'moonshot': {
+        'api_base': 'https://api.moonshot.cn/v1',
+        'api_key_env': ['MOONSHOT_API_KEY'],
+    },
+    'zhipu': {
+        'api_base': 'https://open.bigmodel.cn/api/paas/v4',
+        'api_key_env': ['ZHIPUAI_API_KEY'],
+    },
+    'togetherai': {
+        'api_base': 'https://api.together.xyz/v1',
+        'api_key_env': ['TOGETHER_API_KEY'],
+    },
+    'groq': {
+        'api_base': 'https://api.groq.com/openai/v1',
+        'api_key_env': ['GROQ_API_KEY'],
+    },
+    'xai': {
+        'api_base': 'https://api.x.ai/v1',
+        'api_key_env': ['XAI_API_KEY'],
+    },
+}
+
+GENERIC_API_KEY_ENV = ['OPENAI_API_KEY', 'API_KEY', 'LLM_API_KEY']
+
+
+def _host_of(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower()
+    except Exception:
+        return ''
+
+
+def detect_api_provider(api_base: str = '', model: str = '') -> Optional[str]:
+    """Infer the provider from the API base URL host or, failing that, the model name."""
+    if api_base:
+        base_lower = api_base.lower()
+        for name, meta in API_PROVIDERS.items():
+            canonical_host = _host_of(meta['api_base'])
+            if canonical_host and canonical_host in base_lower:
+                return name
+    if model:
+        model_lower = model.lower()
+        for name in API_PROVIDERS:
+            if name in model_lower:
+                return name
+    return None
+
+
+def resolve_api_key(
+    explicit_key: str,
+    provider: Optional[str],
+    api_key_env: Optional[str],
+    api_base: str = '',
+    model: str = ''
+) -> Tuple[str, Optional[str]]:
+    if explicit_key:
+        return explicit_key, 'config'
+
+    if api_key_env:
+        key = os.environ.get(api_key_env, '').strip()
+        if key:
+            return key, f'env:{api_key_env}'
+
+    resolved_provider = (provider or '').strip().lower() or None
+    if not resolved_provider:
+        resolved_provider = detect_api_provider(api_base, model)
+
+    if resolved_provider:
+        meta = API_PROVIDERS.get(resolved_provider)
+        if meta:
+            for var in meta['api_key_env']:
+                key = os.environ.get(var, '').strip()
+                if key:
+                    return key, f'env:{var}'
+
+    for var in GENERIC_API_KEY_ENV:
+        key = os.environ.get(var, '').strip()
+        if key:
+            return key, f'env:{var}'
+
+    return '', None
+
 
 def format_trajectory(steps: List[Dict[str, Any]], goal: str) -> str:
     lines = [f"Goal: {goal}\n"]
@@ -57,6 +153,14 @@ class GeneratorArguments:
     api_base: Optional[str] = field(
         default=None,
         metadata={"help": "API endpoint URL"}
+    )
+    provider: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "API provider name (e.g. 'deepseek', 'openai', 'anthropic'). "
+                    "Loads the matching API key from its environment variable "
+                    "(e.g. DEEPSEEK_API_KEY) and sets a matching default base URL."
+        }
     )
     model: Optional[str] = field(
         default=None,
@@ -144,7 +248,7 @@ class BaseLLMClient:
     
     def print_summary(self):
         summary = self.get_cost_summary()
-        logger.info(f"Summary:")
+        logger.info("Summary:")
         logger.info(f"  Total Requests: {summary['total_requests']}")
         logger.info(f"  Output Tokens: {summary['total_output_tokens']:,}")
 
@@ -153,11 +257,33 @@ class OpenAIClient(BaseLLMClient):
         super().__init__(config)
         llm_config = config.get('generator', {}).get('api', {})
         
-        self.api_key = llm_config.get('api_key', '')
         self.api_base = llm_config.get('api_base', LLM_API_BASE)
         self.model = llm_config.get('model', LLM_API_MODEL)
         self.timeout = llm_config.get('timeout', 60)
-        
+
+        configured_provider = (llm_config.get('provider') or '').strip().lower() or None
+        detected_provider = detect_api_provider(self.api_base, self.model)
+        self.provider = configured_provider or detected_provider
+
+        if self.provider:
+            meta = API_PROVIDERS.get(self.provider)
+            if meta and (not self.api_base or self.api_base == LLM_API_BASE):
+                self.api_base = meta['api_base']
+
+        explicit_key = llm_config.get('api_key', '')
+        api_key_env = llm_config.get('api_key_env') or None
+        self.api_key, key_source = resolve_api_key(
+            explicit_key,
+            self.provider,
+            api_key_env,
+            self.api_base,
+            self.model
+        )
+
+        if key_source and key_source != 'config':
+            logger.info(f"Loaded API key from environment ({key_source})")
+        logger.info(f"API provider: {self.provider or 'unknown'}")
+
         self._configure_client()
         
         if not config.get('dry_run', False):
@@ -297,6 +423,7 @@ class VLLMClient(BaseLLMClient):
 
     def _initialize_vllm(self):
         try:
+            from vllm import LLM
             logger.info(f"Initializing vLLM with model: {self.model}")
             
             self.llm = LLM(
@@ -338,6 +465,7 @@ class VLLMClient(BaseLLMClient):
     
     def get_responses(self, prompts: List[str], max_tokens: int = None) -> List[str]:
         try:
+            from vllm import SamplingParams
             formatted_prompts = [self._format_prompt(p) for p in prompts]
             
             gen_max_tokens = max_tokens or self.config['train'].get('max_completion_length', 2048)
@@ -673,7 +801,7 @@ Now output your reasoning steps, one per line, starting immediately:
 
         if len(seen_content) < 1:
             if self.debug:
-                logger.debug(f"Validation failed: no unique content items")
+                logger.debug("Validation failed: no unique content items")
             return False
 
         if len(COT_TOKEN_NAMES) > 1 and len(cot_steps) > 3:
@@ -1140,7 +1268,7 @@ class DatasetGenerator:
         }
         
         for latex, unicode in greek_map.items():
-            text = text.replace(latex, unicode)
+            text = re.sub(latex, unicode, text)
         
         operator_map = {
             r'\\times': '×', r'\\cdot': '·', r'\\div': '÷',
@@ -1510,10 +1638,10 @@ class DatasetGenerator:
         valid_letters = ''.join(sorted(self._valid_answers)) if self._valid_answers else 'ABCDE'
         
         return [
-            rf'^OPTION\s*[{valid_letters}]',
-            rf'^CHOICE\s*[{valid_letters}]',
-            rf'^ANSWER\s*[:\-]?\s*[{valid_letters}]',
-            rf'^THE ANSWER IS\s*[:\-]?\s*[{valid_letters}]'
+            rf'^OPTION\s*([{valid_letters}])',
+            rf'^CHOICE\s*([{valid_letters}])',
+            rf'^ANSWER\s*[:\-]?\s*([{valid_letters}])',
+            rf'^THE ANSWER IS\s*[:\-]?\s*([{valid_letters}])'
         ]
     
     def _fallback_normalize_answer(self, raw_answer: Any, options: Any) -> str:
@@ -1659,7 +1787,7 @@ class DatasetGenerator:
                 questions.append(question)
                 answers.append(answer)
                 example_objs.append((question, answer, example))
-            except Exception as e:
+            except Exception:
                 logger.warning(f"Failed to process example: {example}")
                 continue
         
@@ -1700,7 +1828,7 @@ class DatasetGenerator:
             logger.info(f"Sampled {num_examples} examples for {split} split")
 
         if split == "test":
-            logger.info(f"Generating test data without CoT steps")
+            logger.info("Generating test data without CoT steps")
             for i, example in enumerate(tqdm(data_list, desc=f"Processing {self.dataset_name} {split}")):
                 try:
                     question, answer = self._format_question_and_answer_internal(example)
@@ -1945,7 +2073,7 @@ Think:"""
                 return action
         except Exception as e:
             if "maximum context length" in str(e) or "input tokens" in str(e):
-                logger.warning(f"Context length exceeded. Falling back")
+                logger.warning("Context length exceeded. Falling back")
             else:
                 logger.warning(f"LLM expert failed: {e}")
 
@@ -2067,6 +2195,8 @@ def main(args):
             llm_config['api_key'] = args.api_key
         if args.api_base:
             llm_config['api_base'] = args.api_base
+        if args.provider:
+            llm_config['provider'] = args.provider
         if args.model:
             llm_config['model'] = args.model
         if 'model' not in llm_config or not llm_config['model']:
@@ -2115,7 +2245,7 @@ def main(args):
     is_interactive = dataset_config.get('interactive', False)
 
     logger.info(f"{'='*60}")
-    logger.info(f"DATA GENERATION")
+    logger.info("DATA GENERATION")
     logger.info(f"{'='*60}")
     logger.info(f"Dataset: {args.dataset}")
     logger.info(f"Backend: {backend}")

@@ -26,7 +26,7 @@ class ARC3Env:
         return None
 
     def reset(self) -> str:
-        obs = self.official_env.reset()
+        self.official_env.reset()
         self._hook_local_game()
         
         for _ in range(5):

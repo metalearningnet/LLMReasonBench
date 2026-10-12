@@ -1,0 +1,18 @@
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E9", "F"]
+
+[tool.coverage.run]
+source = ["src", "conf"]
+omit = [
+    "src/eval.py",
+    "src/train.py",
+    "src/model_loader.py",
+    "src/peft_model.py",
+    "src/sparse_model.py",
+    "src/dataset_loader.py",
+    "src/dataset/*",
+    "src/training/*",
+]

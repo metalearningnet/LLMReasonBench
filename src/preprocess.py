@@ -274,7 +274,7 @@ class BooleanAnswerExtractor(AnswerExtractor):
                     return 'false'
         
         if re.search(r'\*\*', completion):
-            logger.debug(f"Found '**' in completion, can't extract boolean")
+            logger.debug("Found '**' in completion, can't extract boolean")
             return self.invalid_ans
         
         if completion_lower:
@@ -297,12 +297,15 @@ class EnhancedNumericExtractor(AnswerExtractor):
         completion = completion.strip()
         logger.debug(f"Enhanced numeric extraction from: '{completion[:100]}...'")
         
+        # The capture group stops at a sentence-ending period but allows a
+        # decimal point (a '.' immediately followed by a digit), so answers
+        # like "The answer is 0.5" are not truncated to "0".
         explicit_patterns = [
-            (r'the answer is\s*[:]?\s*([^\.\n]+)', re.IGNORECASE),
-            (r'final answer\s*[:]?\s*([^\.\n]+)', re.IGNORECASE),
-            (r'answer\s*[:]?\s*([^\.\n]+)', re.IGNORECASE),
-            (r'result\s*[:]?\s*([^\.\n]+)', re.IGNORECASE),
-            (r'solution\s*[:]?\s*([^\.\n]+)', re.IGNORECASE)
+            (r'the answer is\s*[:]?\s*((?:[^\.\n]|\.(?=\d))+)', re.IGNORECASE),
+            (r'final answer\s*[:]?\s*((?:[^\.\n]|\.(?=\d))+)', re.IGNORECASE),
+            (r'answer\s*[:]?\s*((?:[^\.\n]|\.(?=\d))+)', re.IGNORECASE),
+            (r'result\s*[:]?\s*((?:[^\.\n]|\.(?=\d))+)', re.IGNORECASE),
+            (r'solution\s*[:]?\s*((?:[^\.\n]|\.(?=\d))+)', re.IGNORECASE)
         ]
         
         for pattern, flags in explicit_patterns:
@@ -469,13 +472,13 @@ class BaseData(Dataset, ABC):
                 logger.debug(f"Selecting MultipleChoiceNormalizer with valid answers: {valid_answers}")
                 return MultipleChoiceNormalizer(valid_answers)
             else:
-                logger.warning(f"Multiple choice dataset has no valid answers, using default")
+                logger.warning("Multiple choice dataset has no valid answers, using default")
                 return MultipleChoiceNormalizer()
         elif answer_type == self.ANSWER_TYPE_ACTION_SEQUENCE:
             logger.debug("Selecting IdentityNormalizer for action_sequence")
             return IdentityNormalizer()
         else:
-            logger.warning(f"Unknown answer type, defaulting to MultipleChoiceNormalizer")
+            logger.warning("Unknown answer type, defaulting to MultipleChoiceNormalizer")
             return MultipleChoiceNormalizer()
     
     def _get_extractor(self) -> AnswerExtractor:
@@ -687,27 +690,31 @@ class BaseData(Dataset, ABC):
         
         text = text.replace(',', '').replace(' ', '').strip().lower()
         
+        # Percentages must be handled before stripping '%', otherwise the
+        # '%' character is removed and the following check can never match.
+        if text.endswith('%'):
+            try:
+                return str(float(text[:-1]) / 100)
+            except ValueError:
+                return None
+        
+        # Fractions must be handled before stripping '/', otherwise '1/2'
+        # would be collapsed into '12'.
+        if '/' in text:
+            parts = text.split('/')
+            if len(parts) == 2:
+                try:
+                    num, denom = float(parts[0]), float(parts[1])
+                    if denom != 0:
+                        return str(num / denom)
+                except ValueError:
+                    return None
+            return None
+        
         text = re.sub(r'[^\d\.\-]', '', text)
         
         if not text:
             return None
-        
-        if '/' in text:
-            try:
-                parts = text.split('/')
-                if len(parts) == 2:
-                    num, denom = float(parts[0]), float(parts[1])
-                    if denom != 0:
-                        return str(num / denom)
-            except:
-                return None
-        
-        if text.endswith('%'):
-            try:
-                value = float(text[:-1]) / 100
-                return str(value)
-            except:
-                return None
         
         return text
     
@@ -724,13 +731,7 @@ class BaseData(Dataset, ABC):
             
             tolerance = 1e-6
             
-            if abs(pred_float - gt_float) < tolerance:
-                return True
-            
-            if round(pred_float) == round(gt_float):
-                return True
-                
-            return False
+            return abs(pred_float - gt_float) < tolerance
         except (ValueError, TypeError):
             return pred_norm == gt_norm
     
@@ -746,7 +747,7 @@ class BaseData(Dataset, ABC):
         return result
     
     def is_correct(self, model_completion: str, ground_truth: str) -> bool:
-        logger.debug(f"Checking correctness: completion vs ground_truth")
+        logger.debug("Checking correctness: completion vs ground_truth")
         
         pred_answer = self.extract_answer(model_completion)
         gt_answer = self.extract_answer(ground_truth)

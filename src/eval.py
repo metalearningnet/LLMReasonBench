@@ -564,7 +564,7 @@ class ModelLoader:
         
         try:
             model = CausalLM.from_pretrained(**load_kwargs)
-            logger.info(f"Base model loaded successfully")
+            logger.info("Base model loaded successfully")
             return model
         except Exception as e:
             logger.error(f"Failed to load base model: {e}")
@@ -824,7 +824,7 @@ class BatchEvaluator:
                                  ['$', '\\boxed', 'sqrt', 'frac', '^', 'pi', 'equation'])
         
         has_multiple_choice = any(pattern in text for pattern in
-                                 ['A)', 'B)', 'C)', 'D)', 'E)', 'F)', 'G)', 'H)', 'I)', 'J)', 'K)'
+                                 ['A)', 'B)', 'C)', 'D)', 'E)', 'F)', 'G)', 'H)', 'I)', 'J)', 'K)',
                                   'A.', 'B.', 'C.', 'D.', 'E.', 'F.', 'G.', 'H.', 'I.', 'J.', 'K.'])
         
         has_code = any(pattern in text for pattern in

@@ -36,7 +36,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 CONF_DIR = PROJECT_ROOT / "conf"
 
 sys.path.append(str(CONF_DIR))
-from tokens import COT_TOKENS, END_MARK
+from tokens import COT_TOKENS, END_MARK as END_MARK
 COT_TOKEN_NAMES = list(COT_TOKENS.keys())
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"

@@ -1,5 +1,5 @@
-from .lm import LMTrainer
-from .utils import create_rl_trainer
+from .lm import LMTrainer as LMTrainer
+from .utils import create_rl_trainer as create_rl_trainer
 from .dpo import RLDPOConfig, RLDPOTrainer, RLDPOPreprocessor
 from .cpo import RLCPOConfig, RLCPOTrainer, RLCPOPreprocessor
 from .kto import RLKTOConfig, RLKTOTrainer, RLKTOPreprocessor

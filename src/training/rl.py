@@ -158,7 +158,7 @@ class RLTrainer:
                     with open(Path(output_dir) / "adapter_config.json", "w") as f:
                         json.dump(config_dict, f, indent=4)
                     
-                    logger.info(f"Manual adapter saving completed")
+                    logger.info("Manual adapter saving completed")
             except Exception as e:
                 logger.error(f"Error saving PEFT adapters: {e}")
                 logger.warning("Falling back to standard model saving")

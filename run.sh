@@ -76,20 +76,19 @@ ensure_uv_installed() {
 
     log_info "uv not found. Installing uv automatically..."
 
-    if command -v curl &>/dev/null; then
-        curl -LsSf https://astral.sh/uv/install.sh | sh
-    elif command -v wget &>/dev/null; then
-        wget -qO- https://astral.sh/uv/install.sh | sh
-    else
-        log_error "Neither curl nor wget found. Please install curl or wget, or install uv manually: https://docs.astral.sh/uv/getting-started/installation/"
+    if ! command -v "$PYTHON" &>/dev/null; then
+        log_error "$PYTHON not found, cannot install uv via pip."
     fi
+
+    "$PYTHON" -m pip --version &>/dev/null || log_error "pip not available for $PYTHON"
+
+    "$PYTHON" -m pip install --user uv || log_error "pip install uv failed"
 
     add_common_uv_paths
 
     if ! command -v uv &>/dev/null; then
-        log_error "Failed to install uv. Please install manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
+        log_error "uv installed via pip but 'uv' command not found in PATH. Tried adding common directories. Please add the appropriate Python script directory to your PATH manually."
     fi
-
     log_info "uv installed successfully: $(uv --version)"
 }
 
@@ -101,7 +100,8 @@ Commands:
   --generate              Run dataset generation
   --train                 Run model training
   --eval                  Run evaluation
-  --clean                 Remove generated outputs and caches
+  --clean                 Remove generated outputs and caches (keeps .venv)
+  --clean-all             Remove everything, including the virtual environment
   -h, --help              Show this help message
 
 Supported Datasets:
@@ -115,12 +115,14 @@ Supported Datasets:
   metamathqa       MetaMathQA
   commonsenseqa    CommonsenseQA
   alfworld         ALFWorld (multi‑turn interactive)
+  arc3             ARC-AGI-3 (multi‑turn interactive)
 
 Generator Options:
   --dataset DATASET       Dataset to generate (see Supported Datasets)
   --mode MODE             Generation mode: train | test
   --api-key KEY           LLM API key
   --api-base URL          LLM API endpoint
+  --provider NAME         API provider (e.g. deepseek, openai). Auto-loads matching *_API_KEY env var
   --model MODEL           Model name
   --num-examples NUM      Number of examples to generate
   --dry-run               Validate configuration without API calls
@@ -349,22 +351,30 @@ show_summary() {
 }
 
 clean() {
-    log_info "Cleaning outputs..."
-    
-    local dirs_to_clean=("$OUTPUT_DIR" "$DATA_DIR" "$LOG_DIR" "$TARGETS_DIR" "$VENV_DIR")
+    log_info "Cleaning generated outputs and caches (keeping the virtual environment)..."
+
+    local dirs_to_clean=(
+        "$OUTPUT_DIR" "$DATA_DIR" "$LOG_DIR" "$TARGETS_DIR"
+        ".pytest_cache" ".ruff_cache" ".mypy_cache" ".uv-cache"
+        "htmlcov" "offload"
+    )
     for dir in "${dirs_to_clean[@]}"; do
         [[ -e "$dir" ]] && rm -rf "$dir"
     done
-    
-    local py_dirs=("$SRC_DIR" "$CONF_DIR")
-    for dir in "${py_dirs[@]}"; do
-        [[ -d "$dir" ]] && find "$dir" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-    done
-    
-    find . -type f -name "*.py[co]" -delete 2>/dev/null || true
-    find . -type d -name "__pycache__" -delete 2>/dev/null || true
-    
-    log_success "Clean completed"
+
+    find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+    find . -type f \( -name "*.py[co]" -o -name ".coverage" -o -name ".coverage.*" -o -name "coverage.xml" \) -delete 2>/dev/null || true
+
+    log_success "Clean completed (virtual environment kept)."
+}
+
+clean_all() {
+    clean
+    if [[ -e "$VENV_DIR" ]]; then
+        log_info "Removing virtual environment: $VENV_DIR"
+        rm -rf "$VENV_DIR"
+    fi
+    log_success "Full clean completed (virtual environment removed)."
 }
 
 main() {
@@ -385,6 +395,10 @@ main() {
             ;;
         --clean)
             clean
+            exit 0
+            ;;
+        --clean-all)
+            clean_all
             exit 0
             ;;
         --generate|--train|--eval)

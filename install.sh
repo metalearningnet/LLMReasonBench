@@ -4,9 +4,7 @@ set -euo pipefail
 PYTHON=${PYTHON:-python3}
 TORCH_VERSION=${TORCH_VERSION:-2.10.0}
 TORCH_CUDA_VERSION=${TORCH_CUDA_VERSION:-cu130}
-UV_VLLM_VERSION=${UV_VLLM_VERSION:-0.19.1}
 UV_PYTHON_VERSION=${UV_PYTHON_VERSION:-3.12}
-UV_INSTALL_METHOD=${UV_INSTALL_METHOD:-standalone}
 
 OS=$(uname -s)
 
@@ -79,40 +77,28 @@ ensure_uv_installed() {
         return 0
     fi
 
-    log_info "uv not found. Installing uv automatically ($UV_INSTALL_METHOD)..."
+    log_info "uv not found. Installing uv automatically..."
 
-    if [[ "$UV_INSTALL_METHOD" == "pip" ]]; then
-        log_info "Installing uv with pip..."
-        if ! command -v "$PYTHON" &>/dev/null; then
-            log_error "$PYTHON not found, cannot install uv via pip."
-        fi
+    if ! command -v "$PYTHON" &>/dev/null; then
+        log_error "$PYTHON not found, cannot install uv via pip."
+    fi
 
-        "$PYTHON" -m pip --version &>/dev/null || log_error "pip not available for $PYTHON"
+    "$PYTHON" -m pip --version &>/dev/null || log_error "pip not available for $PYTHON"
 
-        "$PYTHON" -m pip install --user uv || log_error "pip install uv failed"
+    "$PYTHON" -m pip install --user uv || log_error "pip install uv failed"
 
-        add_common_uv_paths
+    add_common_uv_paths
 
-        if ! command -v uv &>/dev/null; then
-            log_error "uv installed via pip but 'uv' command not found in PATH. Tried adding common directories. Please add the appropriate Python script directory to your PATH manually."
-        fi
-        log_info "uv installed via pip successfully: $(uv --version)"
-    else
-        if command -v curl &>/dev/null; then
-            curl -LsSf https://astral.sh/uv/install.sh | sh
-        elif command -v wget &>/dev/null; then
-            wget -qO- https://astral.sh/uv/install.sh | sh
-        else
-            log_error "Neither curl nor wget found. Please install curl or wget, or install uv manually: https://docs.astral.sh/uv/getting-started/installation/"
-        fi
+    if ! command -v uv &>/dev/null; then
+        log_error "uv installed via pip but 'uv' command not found in PATH. Tried adding common directories. Please add the appropriate Python script directory to your PATH manually."
+    fi
+    log_info "uv installed successfully: $(uv --version)"
+}
 
-        add_common_uv_paths
-
-        if ! command -v uv &>/dev/null; then
-            log_error "Failed to install uv. Please install manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
-        fi
-
-        log_info "uv installed successfully: $(uv --version)"
+ensure_writable_uv_cache() {
+    if [[ -z "${UV_CACHE_DIR:-}" ]] && [[ ! -w "${HOME}/.cache" ]]; then
+        export UV_CACHE_DIR="${TMPDIR:-/tmp}/uv-cache"
+        log_info "Home cache is not writable; using $UV_CACHE_DIR for the uv cache"
     fi
 }
 
@@ -131,6 +117,8 @@ setup_venv() {
 INSTALL_PACKAGES=false
 INSTALL_MODEL=false
 INSTALL_DATASET=false
+INSTALL_DEV=false
+INSTALL_CPU_ONLY=false
 
 MODEL_NAME=""
 MODEL_SOURCE_PATH=""
@@ -156,6 +144,8 @@ ${BOLD}MODES${RESET}
     (no arguments)               Install all Python packages
     --model MODEL                Install a model (currently only 'md')
     --dataset DATASET            Download a Hugging Face dataset
+    --dev                        Install only development/test dependencies (for CI)
+    --cpu                        Install CPU-only PyTorch (for machines without a GPU)
 
 ${BOLD}MODEL INSTALLATION OPTIONS${RESET}
     --model MODEL                Model name to install (required, only 'md' supported)
@@ -170,13 +160,7 @@ ${BOLD}DATASET INSTALLATION OPTIONS${RESET}
     --config CONFIG              Configuration name for multi‑config datasets
     --max-length LENGTH          Limit number of examples
     --output-dir DIR             Directory to save the dataset
-
-${BOLD}GENERAL OPTIONS${RESET}
     --help, -h                   Show this help message
-
-${BOLD}ENVIRONMENT VARIABLES${RESET}
-    UV_VLLM_VERSION              vLLM package version
-    UV_INSTALL_METHOD            How to install uv if missing: 'standalone' or 'pip'
 
 EOF
 }
@@ -256,6 +240,14 @@ parse_arguments() {
                     log_error "--output-dir requires a value"
                 fi
                 ;;
+            --cpu)
+                INSTALL_CPU_ONLY=true
+                shift
+                ;;
+            --dev)
+                INSTALL_DEV=true
+                shift
+                ;;
             --help|-h)
                 usage
                 exit 0
@@ -274,9 +266,10 @@ validate_arguments() {
     local mode_count=0
     [[ "${INSTALL_MODEL}" == "true" ]] && mode_count=$((mode_count + 1))
     [[ "${INSTALL_DATASET:-}" == "true" ]] && mode_count=$((mode_count + 1))
+    [[ "${INSTALL_DEV:-}" == "true" ]] && mode_count=$((mode_count + 1))
 
     if [[ $mode_count -gt 1 ]]; then
-        log_error "Cannot combine --model and --dataset in the same command. Please choose one mode."
+        log_error "Cannot combine --model, --dataset, and --dev. Please choose one mode."
     fi
 
     if [[ $mode_count -eq 0 ]]; then
@@ -318,17 +311,36 @@ validate_arguments() {
     fi
 }
 
+install_dev() {
+    log_info "Installing development/test dependencies (CPU-only PyTorch)..."
+    uv pip install "torch==$TORCH_VERSION" --index-url "https://download.pytorch.org/whl/cpu" \
+        || log_error "Failed to install CPU-only PyTorch"
+    uv pip install pytest pytest-cov ruff PyYAML tqdm openai transformers \
+        || log_error "Failed to install development/test dependencies"
+    log_info "Development/test dependencies installed."
+}
+
 install_pytorch() {
+    if [[ "${INSTALL_CPU_ONLY}" == true ]]; then
+        log_info "Installing CPU-only PyTorch..."
+        uv pip install "torch==$TORCH_VERSION" torchvision torchaudio --index-url "https://download.pytorch.org/whl/cpu" \
+            || log_error "Failed to install CPU-only PyTorch"
+        log_info "CPU-only PyTorch installed."
+        return 0
+    fi
+
     log_info "Installing PyTorch with CUDA version $TORCH_CUDA_VERSION..."
     local index_url="https://download.pytorch.org/whl/$TORCH_CUDA_VERSION"
     uv pip install "torch==$TORCH_VERSION" torchvision torchaudio --index-url "$index_url" \
         || log_error "Failed to install PyTorch from $index_url"
 
-    log_info "Verifying PyTorch installation..."
+    log_info "Verifying PyTorch CUDA availability..."
     if ! uv run python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available'" 2>/dev/null; then
-        log_error "PyTorch CUDA test failed. This often indicates a missing or incompatible NCCL library."
+        log_warning "PyTorch installed, but CUDA is not available on this machine. Training and evaluation will fall back to CPU."
+        log_warning "For a CPU-only install, re-run with --cpu."
+    else
+        log_info "PyTorch installed and CUDA is available."
     fi
-    log_info "PyTorch installed and CUDA is available."
 }
 
 install_packages() {
@@ -371,9 +383,9 @@ install_packages() {
         log_error "Failed to install packages"
     fi
 
-    log_info "Installing vLLM version ${UV_VLLM_VERSION}..."
+    log_info "Installing vLLM..."
     export UV_TORCH_BACKEND=auto
-    uv pip install "vllm==${UV_VLLM_VERSION}" || log_warning "vLLM installation failed"
+    uv pip install vllm || log_warning "vLLM installation failed"
     uv pip install -U transformers || log_warning "Failed to upgrade Transformers"
 
     log_info "Verifying ALFWorld installation..."
@@ -490,6 +502,7 @@ install_dataset() {
 
 main() {
     check_os_support
+    ensure_writable_uv_cache
     ensure_uv_installed
     parse_arguments "$@"
     validate_arguments
@@ -502,6 +515,8 @@ main() {
     if [[ "$INSTALL_PACKAGES" == true ]]; then
         install_pytorch
         install_packages
+    elif [[ "$INSTALL_DEV" == true ]]; then
+        install_dev
     elif [[ "$INSTALL_MODEL" == true ]]; then
         install_model
         install_pytorch
@@ -518,6 +533,8 @@ show_summary() {
         log_success "Dataset installation completed successfully!"
     elif [[ "$INSTALL_MODEL" == true ]]; then
         log_success "Model installation completed successfully!"
+    elif [[ "$INSTALL_DEV" == true ]]; then
+        log_success "Development/test dependencies installed successfully!"
     elif [[ "$INSTALL_PACKAGES" == true ]]; then
         log_success "Package installation completed successfully!"
     fi
